@@ -53,8 +53,8 @@ type PublicationMessage struct {
 	TenantName  string      `json:"tenant_name"`
 	Table       string      `json:"table"`
 	Operation   string      `json:"operation"`
-	NewData     *TaskRecord `json:"new_data,omitempty"`
-	OldData     *TaskRecord `json:"old_data,omitempty"`
+	NewData     json.RawMessage `json:"new_data,omitempty"`
+	OldData     json.RawMessage `json:"old_data,omitempty"`
 	Message     string      `json:"message"`
 	DBTimestamp float64     `json:"db_timestamp"`
 	ClientTime  string      `json:"client_timestamp"`

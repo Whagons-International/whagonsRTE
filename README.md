@@ -6,19 +6,9 @@ A Go implementation of real-time database synchronization using SockJS WebSocket
 
 ### Standard Installation
 ```bash
-go install github.com/suisseworks/whagonsRLE@latest
-```
-
-### If You Encounter Checksum Issues
-For newly published modules, you may need to skip checksum verification:
-```bash
-# Option 1: Set as private module
-go env -w GOPRIVATE=github.com/suisseworks/whagonsRLE
-go install github.com/suisseworks/whagonsRLE@latest
-
-# Option 2: Skip checksum verification
 GOSUMDB=off go install github.com/suisseworks/whagonsRLE@latest
 ```
+
 
 ### Using Make Commands
 ```bash

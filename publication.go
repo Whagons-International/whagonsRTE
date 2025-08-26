@@ -59,14 +59,32 @@ func (e *RealtimeEngine) listenToTenantPublications(tenantName, dbName string) {
 
 	defer listener.Close()
 
-	// Listen to the channel that corresponds to the publication
-	channelName := "whagons_tasks_changes"
-	if err := listener.Listen(channelName); err != nil {
-		log.Printf("❌ Failed to listen to channel %s for tenant %s: %v", channelName, tenantName, err)
+	// Discover all NOTIFY channels for this tenant by inspecting triggers
+	e.mutex.RLock()
+	tenantDB := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+	if tenantDB == nil {
+		log.Printf("❌ No tenant DB connection found for %s", tenantName)
 		return
 	}
 
-	log.Printf("✅ Listening to channel '%s' for tenant: %s", channelName, tenantName)
+	channels, err := discoverNotifyChannels(tenantDB)
+	if err != nil {
+		log.Printf("❌ Failed to discover notify channels for %s: %v", tenantName, err)
+		return
+	}
+	if len(channels) == 0 {
+		log.Printf("⚠️  No notify channels discovered for %s", tenantName)
+	}
+
+	// Subscribe to all discovered channels
+	for _, ch := range channels {
+		if err := listener.Listen(ch); err != nil {
+			log.Printf("❌ Failed to listen to channel %s for tenant %s: %v", ch, tenantName, err)
+			continue
+		}
+		log.Printf("✅ Listening to channel '%s' for tenant: %s", ch, tenantName)
+	}
 
 	for {
 		select {
@@ -84,9 +102,40 @@ func (e *RealtimeEngine) listenToTenantPublications(tenantName, dbName string) {
 	}
 }
 
+// discoverNotifyChannels queries the tenant DB for tables with change triggers
+// and returns the corresponding NOTIFY channels (whagons_<table>_changes)
+func discoverNotifyChannels(db *sql.DB) ([]string, error) {
+	const q = `
+		SELECT c.relname AS table_name
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE NOT t.tgisinternal
+		  AND t.tgname = c.relname || '_changes_trigger'
+		  AND n.nspname = 'public'
+		  AND c.relname LIKE 'wh_%'
+	`
+
+	rows, err := db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var channels []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			continue
+		}
+		channels = append(channels, fmt.Sprintf("whagons_%s_changes", table))
+	}
+	return channels, nil
+}
+
 // handlePublicationNotification processes a PostgreSQL notification
 func (e *RealtimeEngine) handlePublicationNotification(tenantName string, notification *pq.Notification) {
-	log.Printf("📡 Publication notification received from %s: %s", tenantName, notification.Extra)
+	log.Printf("📡 Publication notification received from %s on channel '%s'", tenantName, notification.Channel)
 
 	// Parse the PostgreSQL notification payload once
 	var pgNotification PostgreSQLNotification
@@ -95,61 +144,17 @@ func (e *RealtimeEngine) handlePublicationNotification(tenantName string, notifi
 		return
 	}
 
-	// Create clean publication message
+	// Create generic publication message
 	message := PublicationMessage{
 		Type:        "database",
 		TenantName:  tenantName,
 		Table:       pgNotification.Table,
 		Operation:   pgNotification.Operation,
+		NewData:     pgNotification.NewData,
+		OldData:     pgNotification.OldData,
+		Message:     fmt.Sprintf("%s on %s", pgNotification.Operation, pgNotification.Table),
 		DBTimestamp: pgNotification.Timestamp,
 		ClientTime:  time.Now().Format(time.RFC3339),
-	}
-
-	// Parse task data based on operation
-	switch pgNotification.Operation {
-	case "INSERT":
-		if pgNotification.NewData != nil {
-			var newTask TaskRecord
-			if err := json.Unmarshal(pgNotification.NewData, &newTask); err != nil {
-				log.Printf("❌ Failed to parse new task data: %v", err)
-			} else {
-				message.NewData = &newTask
-			}
-		}
-		message.Message = fmt.Sprintf("New task '%s' created in %s",
-			getTaskName(message.NewData), tenantName)
-
-	case "UPDATE":
-		if pgNotification.NewData != nil {
-			var newTask TaskRecord
-			if err := json.Unmarshal(pgNotification.NewData, &newTask); err != nil {
-				log.Printf("❌ Failed to parse new task data: %v", err)
-			} else {
-				message.NewData = &newTask
-			}
-		}
-		if pgNotification.OldData != nil {
-			var oldTask TaskRecord
-			if err := json.Unmarshal(pgNotification.OldData, &oldTask); err != nil {
-				log.Printf("❌ Failed to parse old task data: %v", err)
-			} else {
-				message.OldData = &oldTask
-			}
-		}
-		message.Message = fmt.Sprintf("Task '%s' updated in %s",
-			getTaskName(message.NewData), tenantName)
-
-	case "DELETE":
-		if pgNotification.OldData != nil {
-			var oldTask TaskRecord
-			if err := json.Unmarshal(pgNotification.OldData, &oldTask); err != nil {
-				log.Printf("❌ Failed to parse old task data: %v", err)
-			} else {
-				message.OldData = &oldTask
-			}
-		}
-		message.Message = fmt.Sprintf("Task '%s' deleted from %s",
-			getTaskName(message.OldData), tenantName)
 	}
 
 	log.Printf("🔄 Processed %s operation on %s.%s - broadcasting to sessions",
@@ -160,12 +165,7 @@ func (e *RealtimeEngine) handlePublicationNotification(tenantName string, notifi
 }
 
 // getTaskName safely extracts the task name from a TaskRecord
-func getTaskName(task *TaskRecord) string {
-	if task == nil {
-		return "unknown"
-	}
-	return task.Name
-}
+// (removed task-specific helper; messages are table-agnostic)
 
 // BroadcastPublicationMessage sends a publication message to authenticated sessions with tenant access
 func (e *RealtimeEngine) BroadcastPublicationMessage(message PublicationMessage) {
