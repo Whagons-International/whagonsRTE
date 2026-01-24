@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -66,15 +67,7 @@ func loadConfiguration() {
 		}
 	}
 
-	// If neither .env nor config file was found, automatically run setup
-	if !fromEnvFile && !fromConfigFile {
-		log.Println("🛠️  No configuration files found - running automatic setup...")
-		log.Println("💡 You can also run with --setup flag to reconfigure anytime")
-		runInteractiveSetup()
-		return
-	}
-
-	// Initialize configuration with defaults
+	// Initialize configuration from environment variables (with defaults)
 	config = Config{
 		DBHost:     getEnv("DB_HOST", "127.0.0.1"),
 		DBPort:     getEnv("DB_PORT", "5432"),
@@ -82,6 +75,26 @@ func loadConfiguration() {
 		DBPassword: getEnv("DB_PASSWORD", ""),
 		DBLandlord: getEnv("DB_LANDLORD", "landlord"),
 		ServerPort: getEnv("SERVER_PORT", "8082"),
+	}
+
+	// If neither .env nor config file was found, prefer real environment variables (common in Docker/K8s).
+	// Only fall back to interactive setup when we're truly missing all config sources.
+	if !fromEnvFile && !fromConfigFile {
+		hasAnyEnv := os.Getenv("DB_HOST") != "" ||
+			os.Getenv("DB_PORT") != "" ||
+			os.Getenv("DB_USERNAME") != "" ||
+			os.Getenv("DB_PASSWORD") != "" ||
+			os.Getenv("DB_LANDLORD") != "" ||
+			os.Getenv("SERVER_PORT") != ""
+
+		if hasAnyEnv {
+			log.Println("✅ Loaded configuration from environment variables")
+		} else {
+			log.Println("🛠️  No configuration sources found (.env / config file / env vars) - running automatic setup...")
+			log.Println("💡 You can also run with --setup flag to reconfigure anytime")
+			runInteractiveSetup()
+			return
+		}
 	}
 
 	// Final validation
@@ -160,7 +173,12 @@ func promptWithDefault(reader *bufio.Reader, name, defaultValue string) string {
 
 	input, err := reader.ReadString('\n')
 	if err != nil {
-		log.Printf("❌ Error reading input for %s: %v", name, err)
+		// In containers / non-interactive pipes, stdin can be closed and return EOF.
+		// Treat this as "use default" instead of logging scary errors.
+		if err == io.EOF {
+			return defaultValue
+		}
+		log.Printf("⚠️  Error reading input for %s: %v", name, err)
 		return defaultValue
 	}
 
