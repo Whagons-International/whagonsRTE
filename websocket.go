@@ -4,13 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
+	"sync"
 	"time"
 
+	"github.com/fasthttp/websocket"
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -27,50 +26,68 @@ const (
 	maxMessageSize = 512 * 1024 // 512KB
 )
 
+var deadlinePanicOnce sync.Once
+
+func safeSetReadDeadline(conn *websocket.Conn, t time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			deadlinePanicOnce.Do(func() {
+				log.Printf("⚠️  Recovered from panic in SetReadDeadline (fasthttp hijackConn). Disabling read deadlines for this process. panic=%v", r)
+			})
+		}
+	}()
+	_ = conn.SetReadDeadline(t)
+}
+
+func safeSetWriteDeadline(conn *websocket.Conn, t time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			deadlinePanicOnce.Do(func() {
+				log.Printf("⚠️  Recovered from panic in SetWriteDeadline (fasthttp hijackConn). Disabling write deadlines for this process. panic=%v", r)
+			})
+		}
+	}()
+	_ = conn.SetWriteDeadline(t)
+}
+
 // websocketHandler handles WebSocket upgrade requests
 func (e *RealtimeEngine) websocketHandler(c *fiber.Ctx) error {
-	// Convert Fiber context to HTTP request/response for WebSocket upgrade
-	return adaptor.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract bearer token and domain from query parameters or headers
-		token := extractBearerToken(
-			r.Header.Get("Authorization"),
-			r.URL.Query().Get("token"),
-		)
-		domain := r.URL.Query().Get("domain")
+	// Get the underlying fasthttp request context
+	fctx := c.Context()
 
-		if token == "" {
-			log.Printf("❌ No bearer token provided")
-			http.Error(w, "Bearer token required", http.StatusUnauthorized)
-			return
-		}
+	// Extract bearer token and domain from query parameters or headers
+	token := extractBearerToken(
+		string(fctx.Request.Header.Peek("Authorization")),
+		string(fctx.QueryArgs().Peek("token")),
+	)
+	domain := string(fctx.QueryArgs().Peek("domain"))
 
-		if domain == "" {
-			log.Printf("❌ No domain provided")
-			http.Error(w, "Domain parameter required", http.StatusBadRequest)
-			return
-		}
+	if token == "" {
+		log.Printf("❌ No bearer token provided")
+		return c.Status(fiber.StatusUnauthorized).SendString("Bearer token required")
+	}
 
-		// Authenticate the token for the specific domain
-		authSession, err := e.authenticateTokenForDomain(token, domain)
-		if err != nil {
-			log.Printf("❌ Authentication failed (domain: %s): %v", domain, err)
-			http.Error(w, fmt.Sprintf("Authentication failed for domain %s", domain), http.StatusUnauthorized)
-			return
-		}
+	if domain == "" {
+		log.Printf("❌ No domain provided")
+		return c.Status(fiber.StatusBadRequest).SendString("Domain parameter required")
+	}
 
-		// Upgrade HTTP connection to WebSocket
-		conn, err := e.upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("❌ WebSocket upgrade failed: %v", err)
-			return
-		}
+	// Authenticate the token for the specific domain
+	authSession, err := e.authenticateTokenForDomain(token, domain)
+	if err != nil {
+		log.Printf("❌ Authentication failed (domain: %s): %v", domain, err)
+		return c.Status(fiber.StatusUnauthorized).SendString(fmt.Sprintf("Authentication failed for domain %s", domain))
+	}
 
+	// Upgrade using a fasthttp-native upgrader (compatible with Fiber/fasthttp).
+	// This avoids the gorilla+fasthttp hijack wrapper that was causing nil deref panics.
+	if err := e.upgrader.Upgrade(fctx, func(wsConn *websocket.Conn) {
 		// Generate session ID
 		sessionID := uuid.New().String()
 
 		// Create WebSocket session
 		wsSession := &WebSocketSession{
-			Conn:     conn,
+			Conn:     wsConn,
 			ID:       sessionID,
 			Tenant:   authSession.TenantName,
 			UserID:   authSession.UserID,
@@ -106,10 +123,21 @@ func (e *RealtimeEngine) websocketHandler(c *fiber.Ctx) error {
 		}
 		e.sendMessage(wsSession, welcomeMsg)
 
-		// Start goroutines for reading and writing
+		// IMPORTANT: With fasthttp hijacked conns, the upgrader expects this handler to
+		// own the connection for its entire lifetime. If we return while goroutines
+		// are still using wsConn, fasthttp/websocket may reuse internal buffers and
+		// the connection wrapper, leading to nil-deref panics in Read/SetReadDeadline.
+		//
+		// So: keep this handler blocked until the connection is closed.
 		go e.writePump(wsSession)
-		go e.readPump(wsSession)
-	}))(c)
+		e.readPump(wsSession)
+	}); err != nil {
+		log.Printf("❌ WebSocket upgrade failed: %v", err)
+		return c.Status(fiber.StatusBadRequest).SendString("WebSocket upgrade failed")
+	}
+
+	// Return nil to prevent Fiber from sending a response (WebSocket handles it)
+	return nil
 }
 
 // readPump handles reading messages from the WebSocket connection
@@ -119,9 +147,9 @@ func (e *RealtimeEngine) readPump(wsSession *WebSocketSession) {
 		wsSession.Conn.Close()
 	}()
 
-	wsSession.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	safeSetReadDeadline(wsSession.Conn, time.Now().Add(pongWait))
 	wsSession.Conn.SetPongHandler(func(string) error {
-		wsSession.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		safeSetReadDeadline(wsSession.Conn, time.Now().Add(pongWait))
 		wsSession.LastPing = time.Now()
 		return nil
 	})
@@ -166,21 +194,18 @@ func (e *RealtimeEngine) writePump(wsSession *WebSocketSession) {
 		wsSession.Conn.Close()
 	}()
 
-	for {
-		select {
-		case <-ticker.C:
-			wsSession.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := wsSession.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("❌ WebSocket ping error for session %s: %v", wsSession.ID, err)
-				return
-			}
+	for range ticker.C {
+		safeSetWriteDeadline(wsSession.Conn, time.Now().Add(writeWait))
+		if err := wsSession.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			log.Printf("❌ WebSocket ping error for session %s: %v", wsSession.ID, err)
+			return
 		}
 	}
 }
 
 // sendMessage sends a message to a WebSocket session
 func (e *RealtimeEngine) sendMessage(wsSession *WebSocketSession, message SystemMessage) error {
-	wsSession.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	safeSetWriteDeadline(wsSession.Conn, time.Now().Add(writeWait))
 
 	jsonMessage, err := json.Marshal(message)
 	if err != nil {
@@ -343,19 +368,13 @@ func (e *RealtimeEngine) cleanupZombieSessions() {
 
 	var zombieSessions []string
 
-	// Create a proper JSON ping message
-	pingMsg := SystemMessage{
-		Type:      "ping",
-		Operation: "health_check",
-		Message:   "Connection health check",
-		Timestamp: time.Now().Format(time.RFC3339),
-	}
-	pingJSON, _ := json.Marshal(pingMsg)
-
 	// Check sessions - if ping fails, mark as zombie
 	for sessionID, wsSession := range e.sessions {
-		wsSession.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-		if err := wsSession.Conn.WriteMessage(websocket.PingMessage, pingJSON); err != nil {
+		safeSetWriteDeadline(wsSession.Conn, time.Now().Add(writeWait))
+		// IMPORTANT: Control frames (Ping/Pong/Close) must have payload <= 125 bytes.
+		// Sending JSON here can exceed that limit and causes "websocket: invalid control frame",
+		// which incorrectly marks healthy sessions as zombies and deletes them from tracking maps.
+		if err := wsSession.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 			log.Printf("🧟 Found zombie session: %s (error: %v)", sessionID, err)
 			zombieSessions = append(zombieSessions, sessionID)
 		}

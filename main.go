@@ -3,13 +3,13 @@ package main
 import (
 	"database/sql"
 	"log"
-	"net/http"
 	"time"
 
+	"github.com/fasthttp/websocket"
 	"github.com/gofiber/fiber/v2"
-	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
 	"github.com/suisseworks/whagonsRTE/routes"
+	"github.com/valyala/fasthttp"
 )
 
 func main() {
@@ -18,8 +18,8 @@ func main() {
 		sessions:              make(map[string]*WebSocketSession),
 		authenticatedSessions: make(map[string]*AuthenticatedSession),
 		tokenCache:            make(map[string]*CachedToken),
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
+		upgrader: websocket.FastHTTPUpgrader{
+			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
 				// Allow all origins for development - be more restrictive in production
 				return true
 			},

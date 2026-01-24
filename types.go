@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/fasthttp/websocket"
 )
 
 // TenantDB represents a tenant database configuration
@@ -67,7 +67,7 @@ type RealtimeEngine struct {
 	authenticatedSessions map[string]*AuthenticatedSession // sessionID -> auth info
 	tokenCache            map[string]*CachedToken          // tokenHash -> cached auth info
 	mutex                 sync.RWMutex
-	upgrader              websocket.Upgrader
+	upgrader              websocket.FastHTTPUpgrader
 }
 
 // AuthenticatedSession represents an authenticated WebSocket session

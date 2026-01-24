@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/fasthttp/websocket"
 	"github.com/lib/pq"
 )
 
@@ -189,6 +189,8 @@ func (e *RealtimeEngine) BroadcastPublicationMessage(message PublicationMessage)
 
 	broadcastCount := 0
 	authorizedCount := 0
+	unauthenticatedCount := 0
+	deniedCount := 0
 
 	for sessionID, wsSession := range sessions {
 		authSession, isAuthenticated := authSessions[sessionID]
@@ -196,6 +198,7 @@ func (e *RealtimeEngine) BroadcastPublicationMessage(message PublicationMessage)
 		if !isAuthenticated {
 			// Skip unauthenticated sessions (shouldn't happen with new auth flow)
 			log.Printf("⚠️ Skipping unauthenticated session %s", sessionID)
+			unauthenticatedCount++
 			continue
 		}
 
@@ -203,6 +206,7 @@ func (e *RealtimeEngine) BroadcastPublicationMessage(message PublicationMessage)
 		if !authSession.canAccessTenant(message.TenantName) {
 			log.Printf("🔒 Session %s (tenant: %s) denied access to %s data",
 				sessionID, authSession.TenantName, message.TenantName)
+			deniedCount++
 			continue
 		}
 
@@ -236,6 +240,12 @@ func (e *RealtimeEngine) BroadcastPublicationMessage(message PublicationMessage)
 		log.Printf("📡 Broadcasted publication to %d/%d authorized sessions for tenant: %s",
 			broadcastCount, authorizedCount, message.TenantName)
 	} else {
-		log.Printf("📡 No authorized sessions found for tenant: %s", message.TenantName)
+		// This is a common "looks weird" case when sockets are alive but the engine's
+		// tracking maps don't line up (e.g., sessions removed from maps while goroutines
+		// are still running, or auth map missing entries).
+		log.Printf(
+			"📡 No authorized sessions found for tenant: %s (sessions=%d authSessions=%d unauthenticated=%d denied=%d)",
+			message.TenantName, len(sessions), len(authSessions), unauthenticatedCount, deniedCount,
+		)
 	}
 }
