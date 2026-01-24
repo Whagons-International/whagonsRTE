@@ -1,0 +1,19 @@
+# Go / build artifacts
+tmp/
+*.log
+*.out
+
+# VCS
+.git/
+.gitignore
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Docs / misc
+readmes/
+backendsample/
+test.html
+
