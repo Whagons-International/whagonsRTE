@@ -124,6 +124,12 @@ func main() {
 	log.Printf("   POST /api/tenants/reload - Reload and connect to new tenants")
 	log.Printf("   POST /api/tenants/test-notification - Test tenant notification system")
 	log.Printf("   POST /api/broadcast - Broadcast message to all sessions")
+	log.Printf("🔒 Super Admin endpoints:")
+	log.Printf("   GET  /api/telemetry/errors - Query error telemetry")
+	log.Printf("   GET  /api/telemetry/stats - Get telemetry statistics")
+	log.Printf("   GET  /api/telemetry/sessions - Get active WebSocket sessions")
+	log.Printf("   GET  /api/telemetry/tenants - Get tenants overview")
+	log.Printf("   POST /api/telemetry/query - Execute read-only SQL queries")
 
 	// Start HTTP server with Fiber
 	log.Fatal(app.Listen(":" + config.ServerPort))
