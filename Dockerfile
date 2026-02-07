@@ -36,7 +36,8 @@ RUN apk add --no-cache ca-certificates tzdata && update-ca-certificates
 RUN addgroup -S app && adduser -S app -G app && chown -R app:app /app
 
 COPY --from=builder /out/whagonsrte /app/whagonsrte
-RUN chmod +x /app/whagonsrte && chown app:app /app/whagonsrte
+COPY --from=builder /src/super_admins.yaml /app/super_admins.yaml
+RUN chmod +x /app/whagonsrte && chown app:app /app/whagonsrte /app/super_admins.yaml
 
 # Default server port (can be overridden via SERVER_PORT env var)
 EXPOSE 8082
