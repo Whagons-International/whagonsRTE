@@ -61,13 +61,16 @@ type WebSocketSession struct {
 
 // RealtimeEngine is the main engine that manages database connections and WebSocket sessions
 type RealtimeEngine struct {
-	landlordDB            *sql.DB
-	tenantDBs             map[string]*sql.DB
-	sessions              map[string]*WebSocketSession     // Active WebSocket sessions
-	authenticatedSessions map[string]*AuthenticatedSession // sessionID -> auth info
-	tokenCache            map[string]*CachedToken          // tokenHash -> cached auth info
-	mutex                 sync.RWMutex
-	upgrader              websocket.FastHTTPUpgrader
+	landlordDB                 *sql.DB
+	tenantDBs                  map[string]*sql.DB
+	tenantPublicationListeners map[string]bool                  // tenantName -> listener started
+	tenantConnectLocks         map[string]*sync.Mutex           // tenantName -> per-tenant connection lock
+	sessions                   map[string]*WebSocketSession     // Active WebSocket sessions
+	authenticatedSessions      map[string]*AuthenticatedSession // sessionID -> auth info
+	tokenCache                 map[string]*CachedToken          // tokenHash -> cached auth info
+	telemetryStore             *TelemetryStore                  // Store for error telemetry
+	mutex                      sync.RWMutex
+	upgrader                   websocket.FastHTTPUpgrader
 }
 
 // AuthenticatedSession represents an authenticated WebSocket session
@@ -100,4 +103,44 @@ type CachedToken struct {
 	AuthSession *AuthenticatedSession
 	ExpiresAt   time.Time
 	Domain      string
+}
+
+// TelemetryError represents a client error received via WebSocket
+type TelemetryError struct {
+	ID        string                `json:"id"`
+	Timestamp string                `json:"timestamp"`
+	Category  string                `json:"category"`
+	Message   string                `json:"message"`
+	Stack     string                `json:"stack,omitempty"`
+	Context   TelemetryErrorContext `json:"context"`
+}
+
+// TelemetryErrorContext contains contextual information about the error
+type TelemetryErrorContext struct {
+	UserID             int                    `json:"userId,omitempty"`
+	UserUID            string                 `json:"userUid,omitempty"`
+	UserEmail          string                 `json:"userEmail,omitempty"`
+	TenantName         string                 `json:"tenantName,omitempty"`
+	AppVersion         string                 `json:"appVersion"`
+	CommitHash         string                 `json:"commitHash"`
+	BuildTime          string                 `json:"buildTime"`
+	URL                string                 `json:"url"`
+	UserAgent          string                 `json:"userAgent"`
+	ReduxStateSnapshot map[string]interface{} `json:"reduxStateSnapshot,omitempty"`
+}
+
+// TelemetryMessage represents a telemetry message from the client
+type TelemetryMessage struct {
+	Type      string         `json:"type"`
+	Operation string         `json:"operation"`
+	Data      TelemetryError `json:"data"`
+}
+
+// TelemetryAckMessage represents an acknowledgment message for received errors
+type TelemetryAckMessage struct {
+	Type      string   `json:"type"`
+	Operation string   `json:"operation"`
+	ErrorIDs  []string `json:"error_ids"`
+	Timestamp string   `json:"timestamp"`
+	SessionId string   `json:"sessionId"`
 }

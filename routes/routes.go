@@ -14,6 +14,7 @@ import (
 type EngineInterface interface {
 	controllers.RealtimeEngineInterface
 	controllers.HealthEngineInterface
+	controllers.TelemetryEngineInterface
 }
 
 // SetupRoutes configures all API routes
@@ -21,6 +22,7 @@ func SetupRoutes(app *fiber.App, engine EngineInterface) {
 	// Create controllers
 	sessionController := controllers.NewSessionController(engine)
 	healthController := controllers.NewHealthController(engine)
+	telemetryController := controllers.NewTelemetryController(engine)
 
 	// Add middleware for logging, CORS, and recovery
 	setupMiddleware(app)
@@ -47,6 +49,19 @@ func SetupRoutes(app *fiber.App, engine EngineInterface) {
 
 	// Broadcasting endpoint
 	api.Post("/broadcast", sessionController.BroadcastMessage)
+
+	// Telemetry endpoints (super admin only - auth handled in controller)
+	telemetry := api.Group("/telemetry")
+	telemetry.Get("/errors", telemetryController.GetErrors)
+	telemetry.Get("/stats", telemetryController.GetStats)
+	telemetry.Get("/sessions", telemetryController.GetSessions)
+	telemetry.Get("/tenants", telemetryController.GetTenants)
+	telemetry.Post("/query", telemetryController.ExecuteQuery)
+	telemetry.Get("/tables", telemetryController.GetTables)
+	telemetry.Get("/columns", telemetryController.GetTableColumns)
+	telemetry.Get("/rows", telemetryController.GetTableRows)
+	telemetry.Put("/row", telemetryController.UpdateRow)
+	telemetry.Delete("/row", telemetryController.DeleteRow)
 }
 
 // setupMiddleware configures middleware for the Fiber app
@@ -59,7 +74,7 @@ func setupMiddleware(app *fiber.App) {
 		return cors.New(cors.Config{
 			AllowOrigins:     "*",
 			AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS,HEAD",
-			AllowHeaders:     "Content-Type,Authorization,X-Requested-With,Accept,Origin,Cache-Control,X-File-Name",
+			AllowHeaders:     "Content-Type,Authorization,X-Requested-With,Accept,Origin,Cache-Control,X-File-Name,X-Domain",
 			AllowCredentials: false,
 			ExposeHeaders:    "Content-Length,Content-Range",
 		})(c)

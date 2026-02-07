@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/fasthttp/websocket"
@@ -14,10 +15,12 @@ import (
 
 func main() {
 	engine := &RealtimeEngine{
-		tenantDBs:             make(map[string]*sql.DB),
-		sessions:              make(map[string]*WebSocketSession),
-		authenticatedSessions: make(map[string]*AuthenticatedSession),
-		tokenCache:            make(map[string]*CachedToken),
+		tenantDBs:                  make(map[string]*sql.DB),
+		tenantPublicationListeners: make(map[string]bool),
+		tenantConnectLocks:         make(map[string]*sync.Mutex),
+		sessions:                   make(map[string]*WebSocketSession),
+		authenticatedSessions:      make(map[string]*AuthenticatedSession),
+		tokenCache:                 make(map[string]*CachedToken),
 		upgrader: websocket.FastHTTPUpgrader{
 			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
 				// Allow all origins for development - be more restrictive in production
@@ -34,6 +37,13 @@ func main() {
 		log.Println("🔍 Application will start but database operations may fail")
 	} else {
 		defer engine.landlordDB.Close()
+
+		// Initialize telemetry store
+		engine.telemetryStore = NewTelemetryStore(engine.landlordDB)
+		if err := engine.telemetryStore.EnsureTable(); err != nil {
+			log.Printf("⚠️  Failed to setup telemetry store: %v", err)
+			log.Println("🔍 Error telemetry will not be stored")
+		}
 
 		// Load tenant databases
 		if err := engine.loadTenantDatabases(); err != nil {
@@ -114,6 +124,12 @@ func main() {
 	log.Printf("   POST /api/tenants/reload - Reload and connect to new tenants")
 	log.Printf("   POST /api/tenants/test-notification - Test tenant notification system")
 	log.Printf("   POST /api/broadcast - Broadcast message to all sessions")
+	log.Printf("🔒 Super Admin endpoints:")
+	log.Printf("   GET  /api/telemetry/errors - Query error telemetry")
+	log.Printf("   GET  /api/telemetry/stats - Get telemetry statistics")
+	log.Printf("   GET  /api/telemetry/sessions - Get active WebSocket sessions")
+	log.Printf("   GET  /api/telemetry/tenants - Get tenants overview")
+	log.Printf("   POST /api/telemetry/query - Execute read-only SQL queries")
 
 	// Start HTTP server with Fiber
 	log.Fatal(app.Listen(":" + config.ServerPort))

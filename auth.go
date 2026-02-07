@@ -50,13 +50,56 @@ func (e *RealtimeEngine) authenticateTokenForDomainDB(bearerToken, domain string
 
 	log.Printf("🔍 Found tenant '%s' with database '%s' for domain: %s", tenantInfo.Name, tenantInfo.Database, domain)
 
-	// Get the tenant database connection
+	// Get the tenant database connection (connect on-demand if not yet discovered)
+	connectLock := e.getTenantConnectLock(tenantInfo.Name)
+	connectLock.Lock()
+	defer connectLock.Unlock()
+
 	e.mutex.RLock()
 	tenantDB, exists := e.tenantDBs[tenantInfo.Name]
 	e.mutex.RUnlock()
 
 	if !exists {
-		return nil, fmt.Errorf("database connection not found for tenant: %s", tenantInfo.Name)
+		log.Printf("⚠️  Tenant DB not connected yet for %s (domain: %s). Connecting on-demand...", tenantInfo.Name, domain)
+
+		// A tenant row can exist before the tenant DB is ready. Retry a few times with backoff.
+		const maxRetries = 5
+		baseDelay := 200 * time.Millisecond
+		var lastErr error
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			if err := e.connectToTenant(*tenantInfo); err != nil {
+				lastErr = err
+				if attempt == maxRetries {
+					break
+				}
+				delay := time.Duration(attempt) * baseDelay
+				log.Printf("⏱️  On-demand tenant connect failed for %s (attempt %d/%d). Retrying in %v... (error: %v)",
+					tenantInfo.Name, attempt, maxRetries, delay, err)
+				time.Sleep(delay)
+				continue
+			}
+
+			// Connected successfully: start the publication listener for this tenant (exactly once).
+			e.startPublicationListenerOnce(tenantInfo.Name, tenantInfo.Database)
+
+			lastErr = nil
+			break
+		}
+
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to connect to tenant database for %s: %w", tenantInfo.Name, lastErr)
+		}
+
+		// Re-fetch the connected DB handle
+		e.mutex.RLock()
+		tenantDB, exists = e.tenantDBs[tenantInfo.Name]
+		e.mutex.RUnlock()
+		if !exists || tenantDB == nil {
+			return nil, fmt.Errorf("tenant database connection still not available for tenant: %s", tenantInfo.Name)
+		}
+
+		log.Printf("✅ On-demand tenant DB connected for %s (domain: %s)", tenantInfo.Name, domain)
 	}
 
 	// Parse Laravel Sanctum token format: {token_id}|{plain_text_token}
@@ -288,4 +331,699 @@ func (e *RealtimeEngine) cleanupExpiredTokens() {
 	if len(expiredKeys) > 0 {
 		log.Printf("🧹 Cleaned up %d expired cached tokens", len(expiredKeys))
 	}
+}
+
+// AuthenticateAndGetEmail authenticates a token and returns the user's email
+// This combines token authentication with email lookup in one call
+func (e *RealtimeEngine) AuthenticateAndGetEmail(bearerToken, domain string) (string, error) {
+	authSession, err := e.authenticateTokenForDomain(bearerToken, domain)
+	if err != nil {
+		return "", err
+	}
+
+	// Get user email from tenant database
+	e.mutex.RLock()
+	tenantDB, exists := e.tenantDBs[authSession.TenantName]
+	e.mutex.RUnlock()
+
+	if !exists || tenantDB == nil {
+		return "", fmt.Errorf("tenant database not found: %s", authSession.TenantName)
+	}
+
+	var email string
+	err = tenantDB.QueryRow("SELECT email FROM wh_users WHERE id = $1", authSession.UserID).Scan(&email)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("user not found: %d", authSession.UserID)
+		}
+		return "", fmt.Errorf("database error: %w", err)
+	}
+
+	return email, nil
+}
+
+// GetTelemetryStore returns the telemetry store instance
+func (e *RealtimeEngine) GetTelemetryStore() *TelemetryStore {
+	return e.telemetryStore
+}
+
+// QueryTelemetryErrors wraps the telemetry store query method for the controller interface
+func (e *RealtimeEngine) QueryTelemetryErrors(page, perPage int, tenantName, category string, userID int, search, startDate, endDate, sortBy, sortOrder string) (interface{}, error) {
+	if e.telemetryStore == nil {
+		return nil, fmt.Errorf("telemetry store not available")
+	}
+
+	params := TelemetryQueryParams{
+		Page:       page,
+		PerPage:    perPage,
+		TenantName: tenantName,
+		Category:   category,
+		UserID:     userID,
+		Search:     search,
+		StartDate:  startDate,
+		EndDate:    endDate,
+		SortBy:     sortBy,
+		SortOrder:  sortOrder,
+	}
+
+	return e.telemetryStore.QueryErrors(params)
+}
+
+// GetTelemetryStats wraps the telemetry store stats method for the controller interface
+func (e *RealtimeEngine) GetTelemetryStats() (interface{}, error) {
+	if e.telemetryStore == nil {
+		return nil, fmt.Errorf("telemetry store not available")
+	}
+
+	return e.telemetryStore.GetStats()
+}
+
+// SessionInfo represents session info for the API response
+type SessionInfo struct {
+	SessionID   string `json:"session_id"`
+	TenantName  string `json:"tenant_name"`
+	UserID      int    `json:"user_id"`
+	UserEmail   string `json:"user_email"`
+	ConnectedAt string `json:"connected_at"`
+	LastPing    string `json:"last_ping"`
+}
+
+// SessionsResponse represents the sessions API response
+type SessionsResponse struct {
+	Sessions []SessionInfo  `json:"sessions"`
+	Total    int            `json:"total"`
+	ByTenant map[string]int `json:"by_tenant"`
+}
+
+// GetSessionsInfo returns information about all active WebSocket sessions
+func (e *RealtimeEngine) GetSessionsInfo() (interface{}, error) {
+	e.mutex.RLock()
+	defer e.mutex.RUnlock()
+
+	sessions := make([]SessionInfo, 0, len(e.sessions))
+	byTenant := make(map[string]int)
+
+	for sessionID, wsSession := range e.sessions {
+		// Try to get user email from tenant DB
+		email := ""
+		if tenantDB, exists := e.tenantDBs[wsSession.Tenant]; exists && tenantDB != nil {
+			_ = tenantDB.QueryRow("SELECT email FROM wh_users WHERE id = $1", wsSession.UserID).Scan(&email)
+		}
+
+		// Get auth session for more details
+		authSession := e.authenticatedSessions[sessionID]
+		connectedAt := ""
+		if authSession != nil {
+			connectedAt = authSession.LastUsedAt.Format(time.RFC3339)
+		}
+
+		sessions = append(sessions, SessionInfo{
+			SessionID:   sessionID,
+			TenantName:  wsSession.Tenant,
+			UserID:      wsSession.UserID,
+			UserEmail:   email,
+			ConnectedAt: connectedAt,
+			LastPing:    wsSession.LastPing.Format(time.RFC3339),
+		})
+
+		byTenant[wsSession.Tenant]++
+	}
+
+	return &SessionsResponse{
+		Sessions: sessions,
+		Total:    len(sessions),
+		ByTenant: byTenant,
+	}, nil
+}
+
+// TenantInfo represents tenant info for the API response
+type TenantInfo struct {
+	ID             int    `json:"id"`
+	Name           string `json:"name"`
+	Domain         string `json:"domain"`
+	Database       string `json:"database"`
+	Connected      bool   `json:"connected"`
+	ActiveSessions int    `json:"active_sessions"`
+}
+
+// TenantsResponse represents the tenants API response
+type TenantsResponse struct {
+	Tenants   []TenantInfo `json:"tenants"`
+	Total     int          `json:"total"`
+	Connected int          `json:"connected"`
+}
+
+// GetTenantsInfo returns information about all tenants
+func (e *RealtimeEngine) GetTenantsInfo() (interface{}, error) {
+	if e.landlordDB == nil {
+		return nil, fmt.Errorf("landlord database not connected")
+	}
+
+	// Query all tenants from landlord
+	rows, err := e.landlordDB.Query("SELECT id, name, domain, database FROM tenants WHERE database IS NOT NULL ORDER BY name")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tenants: %w", err)
+	}
+	defer rows.Close()
+
+	e.mutex.RLock()
+	defer e.mutex.RUnlock()
+
+	// Count sessions per tenant
+	sessionsByTenant := make(map[string]int)
+	for _, wsSession := range e.sessions {
+		sessionsByTenant[wsSession.Tenant]++
+	}
+
+	tenants := []TenantInfo{}
+	connectedCount := 0
+
+	for rows.Next() {
+		var t TenantInfo
+		if err := rows.Scan(&t.ID, &t.Name, &t.Domain, &t.Database); err != nil {
+			continue
+		}
+
+		// Check if we're connected to this tenant
+		_, connected := e.tenantDBs[t.Name]
+		t.Connected = connected
+		if connected {
+			connectedCount++
+		}
+
+		t.ActiveSessions = sessionsByTenant[t.Name]
+		tenants = append(tenants, t)
+	}
+
+	return &TenantsResponse{
+		Tenants:   tenants,
+		Total:     len(tenants),
+		Connected: connectedCount,
+	}, nil
+}
+
+// DbQueryResult represents a database query result
+type DbQueryResult struct {
+	Columns         []string                 `json:"columns"`
+	Rows            []map[string]interface{} `json:"rows"`
+	RowCount        int                      `json:"row_count"`
+	ExecutionTimeMs float64                  `json:"execution_time_ms"`
+}
+
+// ExecuteReadOnlyQuery executes a read-only SQL query against a tenant database
+func (e *RealtimeEngine) ExecuteReadOnlyQuery(tenantName, query string) (interface{}, error) {
+	e.mutex.RLock()
+	tenantDB, exists := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+
+	if !exists || tenantDB == nil {
+		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
+	}
+
+	// Basic safety check - only allow SELECT statements
+	normalizedQuery := strings.TrimSpace(strings.ToUpper(query))
+	if !strings.HasPrefix(normalizedQuery, "SELECT") &&
+		!strings.HasPrefix(normalizedQuery, "WITH") &&
+		!strings.HasPrefix(normalizedQuery, "EXPLAIN") {
+		return nil, fmt.Errorf("only SELECT/WITH/EXPLAIN queries are allowed")
+	}
+
+	// Disallow dangerous keywords
+	dangerousKeywords := []string{"INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE"}
+	for _, keyword := range dangerousKeywords {
+		if strings.Contains(normalizedQuery, keyword) {
+			return nil, fmt.Errorf("query contains forbidden keyword: %s", keyword)
+		}
+	}
+
+	start := time.Now()
+
+	rows, err := tenantDB.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns: %w", err)
+	}
+
+	// Prepare result
+	result := &DbQueryResult{
+		Columns: columns,
+		Rows:    []map[string]interface{}{},
+	}
+
+	// Read rows (limit to 1000 for safety)
+	rowCount := 0
+	maxRows := 1000
+
+	for rows.Next() && rowCount < maxRows {
+		// Create a slice of interface{} to hold the values
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+
+		// Convert to map
+		row := make(map[string]interface{})
+		for i, col := range columns {
+			val := values[i]
+			// Convert byte slices to strings for JSON
+			if b, ok := val.([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = val
+			}
+		}
+
+		result.Rows = append(result.Rows, row)
+		rowCount++
+	}
+
+	result.RowCount = rowCount
+	result.ExecutionTimeMs = float64(time.Since(start).Microseconds()) / 1000.0
+
+	return result, nil
+}
+
+// TableInfo represents information about a database table
+type TableInfo struct {
+	Name      string `json:"name"`
+	Schema    string `json:"schema"`
+	RowCount  int64  `json:"row_count"`
+	TableType string `json:"table_type"`
+}
+
+// TablesResponse represents the response for GetDatabaseTables
+type TablesResponse struct {
+	Tables []TableInfo `json:"tables"`
+	Total  int         `json:"total"`
+}
+
+// GetDatabaseTables returns all tables in a tenant database
+func (e *RealtimeEngine) GetDatabaseTables(tenantName string) (interface{}, error) {
+	e.mutex.RLock()
+	tenantDB, exists := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+
+	if !exists || tenantDB == nil {
+		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
+	}
+
+	// Query tables from pg_tables (public schema only for tenant DBs)
+	query := `
+		SELECT 
+			t.tablename as name,
+			t.schemaname as schema,
+			COALESCE(s.n_live_tup, 0) as row_count,
+			'table' as table_type
+		FROM pg_tables t
+		LEFT JOIN pg_stat_user_tables s ON t.tablename = s.relname AND t.schemaname = s.schemaname
+		WHERE t.schemaname = 'public'
+		ORDER BY t.tablename
+	`
+
+	rows, err := tenantDB.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tables: %w", err)
+	}
+	defer rows.Close()
+
+	tables := []TableInfo{}
+	for rows.Next() {
+		var t TableInfo
+		if err := rows.Scan(&t.Name, &t.Schema, &t.RowCount, &t.TableType); err != nil {
+			continue
+		}
+		tables = append(tables, t)
+	}
+
+	return &TablesResponse{
+		Tables: tables,
+		Total:  len(tables),
+	}, nil
+}
+
+// ColumnInfo represents information about a table column
+type ColumnInfo struct {
+	Name         string  `json:"name"`
+	DataType     string  `json:"data_type"`
+	IsNullable   bool    `json:"is_nullable"`
+	DefaultValue *string `json:"default_value"`
+	IsPrimaryKey bool    `json:"is_primary_key"`
+	OrdinalPos   int     `json:"ordinal_position"`
+}
+
+// ColumnsResponse represents the response for GetTableColumns
+type ColumnsResponse struct {
+	Columns   []ColumnInfo `json:"columns"`
+	TableName string       `json:"table_name"`
+	Total     int          `json:"total"`
+}
+
+// GetTableColumns returns column information for a specific table
+func (e *RealtimeEngine) GetTableColumns(tenantName, tableName string) (interface{}, error) {
+	e.mutex.RLock()
+	tenantDB, exists := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+
+	if !exists || tenantDB == nil {
+		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
+	}
+
+	// Validate table name to prevent SQL injection
+	if !isValidIdentifier(tableName) {
+		return nil, fmt.Errorf("invalid table name: %s", tableName)
+	}
+
+	// Query columns from information_schema
+	query := `
+		SELECT 
+			c.column_name,
+			c.data_type,
+			c.is_nullable = 'YES' as is_nullable,
+			c.column_default,
+			COALESCE(
+				(SELECT true FROM information_schema.table_constraints tc
+				 JOIN information_schema.key_column_usage kcu 
+				 ON tc.constraint_name = kcu.constraint_name
+				 WHERE tc.table_name = c.table_name 
+				 AND tc.constraint_type = 'PRIMARY KEY'
+				 AND kcu.column_name = c.column_name
+				 LIMIT 1), false
+			) as is_primary_key,
+			c.ordinal_position
+		FROM information_schema.columns c
+		WHERE c.table_schema = 'public' AND c.table_name = $1
+		ORDER BY c.ordinal_position
+	`
+
+	rows, err := tenantDB.Query(query, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query columns: %w", err)
+	}
+	defer rows.Close()
+
+	columns := []ColumnInfo{}
+	for rows.Next() {
+		var col ColumnInfo
+		var defaultValue sql.NullString
+		if err := rows.Scan(&col.Name, &col.DataType, &col.IsNullable, &defaultValue, &col.IsPrimaryKey, &col.OrdinalPos); err != nil {
+			continue
+		}
+		if defaultValue.Valid {
+			col.DefaultValue = &defaultValue.String
+		}
+		columns = append(columns, col)
+	}
+
+	return &ColumnsResponse{
+		Columns:   columns,
+		TableName: tableName,
+		Total:     len(columns),
+	}, nil
+}
+
+// RowsResponse represents the response for GetTableRows
+type RowsResponse struct {
+	Rows       []map[string]interface{} `json:"rows"`
+	Columns    []string                 `json:"columns"`
+	Total      int64                    `json:"total"`
+	Page       int                      `json:"page"`
+	PerPage    int                      `json:"per_page"`
+	TotalPages int                      `json:"total_pages"`
+	TableName  string                   `json:"table_name"`
+}
+
+// GetTableRows returns paginated rows from a specific table
+func (e *RealtimeEngine) GetTableRows(tenantName, tableName string, page, perPage int, sortBy, sortOrder string) (interface{}, error) {
+	e.mutex.RLock()
+	tenantDB, exists := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+
+	if !exists || tenantDB == nil {
+		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
+	}
+
+	// Validate table name to prevent SQL injection
+	if !isValidIdentifier(tableName) {
+		return nil, fmt.Errorf("invalid table name: %s", tableName)
+	}
+
+	// Validate and sanitize sort parameters
+	if sortBy != "" && !isValidIdentifier(sortBy) {
+		return nil, fmt.Errorf("invalid sort column: %s", sortBy)
+	}
+	if sortOrder != "asc" && sortOrder != "desc" {
+		sortOrder = "asc"
+	}
+
+	// Default pagination
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 || perPage > 1000 {
+		perPage = 100
+	}
+
+	// Get total count
+	var total int64
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)
+	if err := tenantDB.QueryRow(countQuery).Scan(&total); err != nil {
+		return nil, fmt.Errorf("failed to count rows: %w", err)
+	}
+
+	// Calculate pagination
+	offset := (page - 1) * perPage
+	totalPages := int((total + int64(perPage) - 1) / int64(perPage))
+
+	// Build query with optional sorting
+	query := fmt.Sprintf("SELECT * FROM %s", tableName)
+	if sortBy != "" {
+		query += fmt.Sprintf(" ORDER BY %s %s", sortBy, sortOrder)
+	}
+	query += fmt.Sprintf(" LIMIT %d OFFSET %d", perPage, offset)
+
+	rows, err := tenantDB.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query rows: %w", err)
+	}
+	defer rows.Close()
+
+	// Get column names
+	columnNames, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns: %w", err)
+	}
+
+	// Read rows
+	resultRows := []map[string]interface{}{}
+	for rows.Next() {
+		values := make([]interface{}, len(columnNames))
+		valuePtrs := make([]interface{}, len(columnNames))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+
+		row := make(map[string]interface{})
+		for i, col := range columnNames {
+			val := values[i]
+			// Convert byte slices to strings for JSON
+			if b, ok := val.([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = val
+			}
+		}
+		resultRows = append(resultRows, row)
+	}
+
+	return &RowsResponse{
+		Rows:       resultRows,
+		Columns:    columnNames,
+		Total:      total,
+		Page:       page,
+		PerPage:    perPage,
+		TotalPages: totalPages,
+		TableName:  tableName,
+	}, nil
+}
+
+// isValidIdentifier checks if a string is a valid SQL identifier (table/column name)
+func isValidIdentifier(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	// Only allow alphanumeric and underscore, must start with letter or underscore
+	for i, r := range name {
+		if i == 0 {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_') {
+				return false
+			}
+		} else {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// UpdateTableRow updates a row in a tenant database
+func (e *RealtimeEngine) UpdateTableRow(tenantName, tableName string, primaryKey, updates map[string]interface{}, force bool) error {
+	e.mutex.RLock()
+	tenantDB, exists := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+
+	if !exists || tenantDB == nil {
+		return fmt.Errorf("tenant database not connected: %s", tenantName)
+	}
+
+	// Validate table name
+	if !isValidIdentifier(tableName) {
+		return fmt.Errorf("invalid table name: %s", tableName)
+	}
+
+	// Validate all column names in primary key and updates
+	for col := range primaryKey {
+		if !isValidIdentifier(col) {
+			return fmt.Errorf("invalid column name in primary key: %s", col)
+		}
+	}
+	for col := range updates {
+		if !isValidIdentifier(col) {
+			return fmt.Errorf("invalid column name in updates: %s", col)
+		}
+	}
+
+	// Build UPDATE query
+	setClauses := []string{}
+	whereClause := []string{}
+	args := []interface{}{}
+	argIndex := 1
+
+	for col, val := range updates {
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col, argIndex))
+		args = append(args, val)
+		argIndex++
+	}
+
+	for col, val := range primaryKey {
+		whereClause = append(whereClause, fmt.Sprintf("%s = $%d", col, argIndex))
+		args = append(args, val)
+		argIndex++
+	}
+
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		tableName,
+		strings.Join(setClauses, ", "),
+		strings.Join(whereClause, " AND "),
+	)
+
+	log.Printf("⚠️ [TECH SUPPORT] Executing UPDATE on %s.%s: %s", tenantName, tableName, query)
+
+	result, err := tenantDB.Exec(query, args...)
+	if err != nil {
+		// Check for foreign key violation
+		if strings.Contains(err.Error(), "foreign key") && !force {
+			return fmt.Errorf("foreign key constraint violation - enable 'force' to bypass: %w", err)
+		}
+		return fmt.Errorf("update failed: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	log.Printf("✅ [TECH SUPPORT] UPDATE affected %d rows", rowsAffected)
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("no rows matched the primary key")
+	}
+
+	return nil
+}
+
+// DeleteTableRow deletes a row from a tenant database
+func (e *RealtimeEngine) DeleteTableRow(tenantName, tableName string, primaryKey map[string]interface{}, force bool) error {
+	e.mutex.RLock()
+	tenantDB, exists := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+
+	if !exists || tenantDB == nil {
+		return fmt.Errorf("tenant database not connected: %s", tenantName)
+	}
+
+	// Validate table name
+	if !isValidIdentifier(tableName) {
+		return fmt.Errorf("invalid table name: %s", tableName)
+	}
+
+	// Validate all column names in primary key
+	for col := range primaryKey {
+		if !isValidIdentifier(col) {
+			return fmt.Errorf("invalid column name in primary key: %s", col)
+		}
+	}
+
+	// Build DELETE query
+	whereClause := []string{}
+	args := []interface{}{}
+	argIndex := 1
+
+	for col, val := range primaryKey {
+		whereClause = append(whereClause, fmt.Sprintf("%s = $%d", col, argIndex))
+		args = append(args, val)
+		argIndex++
+	}
+
+	// If force is enabled, temporarily disable triggers to bypass foreign key constraints
+	if force {
+		// Disable triggers for this session
+		_, err := tenantDB.Exec("SET session_replication_role = replica")
+		if err != nil {
+			log.Printf("⚠️ [TECH SUPPORT] Failed to disable triggers: %v", err)
+		}
+		defer func() {
+			// Re-enable triggers
+			_, err := tenantDB.Exec("SET session_replication_role = DEFAULT")
+			if err != nil {
+				log.Printf("⚠️ [TECH SUPPORT] Failed to re-enable triggers: %v", err)
+			}
+		}()
+	}
+
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s",
+		tableName,
+		strings.Join(whereClause, " AND "),
+	)
+
+	log.Printf("⚠️ [TECH SUPPORT] Executing DELETE on %s.%s: %s (force=%v)", tenantName, tableName, query, force)
+
+	result, err := tenantDB.Exec(query, args...)
+	if err != nil {
+		// Check for foreign key violation
+		if strings.Contains(err.Error(), "foreign key") || strings.Contains(err.Error(), "violates") {
+			return fmt.Errorf("foreign key constraint violation - enable 'force' to bypass constraints: %w", err)
+		}
+		return fmt.Errorf("delete failed: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	log.Printf("✅ [TECH SUPPORT] DELETE affected %d rows", rowsAffected)
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("no rows matched the primary key")
+	}
+
+	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/lib/pq"
@@ -176,7 +177,7 @@ func (e *RealtimeEngine) reloadTenantDatabases() error {
 			log.Printf("✅ Connected to new tenant database: %s", tenant.Name)
 
 			// Start publication listener for the new tenant
-			go e.listenToTenantPublications(tenant.Name, tenant.Database)
+			e.startPublicationListenerOnce(tenant.Name, tenant.Database)
 			newTenantsCount++
 		}
 	}
@@ -352,6 +353,23 @@ func (e *RealtimeEngine) handleTenantChangeNotification(notification *pq.Notific
 	}
 }
 
+// getTenantConnectLock returns a per-tenant mutex used to serialize first-time connections.
+// This prevents multiple concurrent client auths from opening multiple DB pools for the same tenant.
+func (e *RealtimeEngine) getTenantConnectLock(tenantName string) *sync.Mutex {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+
+	if e.tenantConnectLocks == nil {
+		e.tenantConnectLocks = make(map[string]*sync.Mutex)
+	}
+	if l, ok := e.tenantConnectLocks[tenantName]; ok {
+		return l
+	}
+	l := &sync.Mutex{}
+	e.tenantConnectLocks[tenantName] = l
+	return l
+}
+
 // connectToTenant establishes connection to a specific tenant database
 func (e *RealtimeEngine) connectToTenant(tenant TenantDB) error {
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
@@ -413,7 +431,7 @@ func (e *RealtimeEngine) connectToTenantWithRetry(tenant TenantDB) {
 		log.Printf("✅ Connected to new tenant: %s (attempt %d)", tenant.Name, attempt)
 
 		// Start publication listener for the new tenant
-		go e.listenToTenantPublications(tenant.Name, tenant.Database)
+		e.startPublicationListenerOnce(tenant.Name, tenant.Database)
 		return
 	}
 }
