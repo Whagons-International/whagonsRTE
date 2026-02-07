@@ -15,12 +15,13 @@ import (
 
 // Config holds all configuration values
 type Config struct {
-	DBHost     string `json:"db_host"`
-	DBPort     string `json:"db_port"`
-	DBUsername string `json:"db_username"`
-	DBPassword string `json:"db_password"`
-	DBLandlord string `json:"db_landlord"`
-	ServerPort string `json:"server_port"`
+	DBHost      string `json:"db_host"`
+	DBPort      string `json:"db_port"`
+	DBUsername  string `json:"db_username"`
+	DBPassword  string `json:"db_password"`
+	DBLandlord  string `json:"db_landlord"`
+	DBTelemetry string `json:"db_telemetry"` // Separate database for error telemetry
+	ServerPort  string `json:"server_port"`
 }
 
 var config Config
@@ -69,12 +70,13 @@ func loadConfiguration() {
 
 	// Initialize configuration from environment variables (with defaults)
 	config = Config{
-		DBHost:     getEnv("DB_HOST", "127.0.0.1"),
-		DBPort:     getEnv("DB_PORT", "5432"),
-		DBUsername: getEnv("DB_USERNAME", "postgres"),
-		DBPassword: getEnv("DB_PASSWORD", ""),
-		DBLandlord: getEnv("DB_LANDLORD", "landlord"),
-		ServerPort: getEnv("SERVER_PORT", "8082"),
+		DBHost:      getEnv("DB_HOST", "127.0.0.1"),
+		DBPort:      getEnv("DB_PORT", "5432"),
+		DBUsername:  getEnv("DB_USERNAME", "postgres"),
+		DBPassword:  getEnv("DB_PASSWORD", ""),
+		DBLandlord:  getEnv("DB_LANDLORD", "landlord"),
+		DBTelemetry: getEnv("DB_TELEMETRY", "rte_telemetry"),
+		ServerPort:  getEnv("SERVER_PORT", "8082"),
 	}
 
 	// If neither .env nor config file was found, prefer real environment variables (common in Docker/K8s).

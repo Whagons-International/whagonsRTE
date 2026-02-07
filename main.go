@@ -38,17 +38,25 @@ func main() {
 	} else {
 		defer engine.landlordDB.Close()
 
-		// Initialize telemetry store
-		engine.telemetryStore = NewTelemetryStore(engine.landlordDB)
-		if err := engine.telemetryStore.EnsureTable(); err != nil {
-			log.Printf("⚠️  Failed to setup telemetry store: %v", err)
-			log.Println("🔍 Error telemetry will not be stored")
-		}
-
 		// Load tenant databases
 		if err := engine.loadTenantDatabases(); err != nil {
 			log.Printf("⚠️  Failed to load tenant databases: %v", err)
 			log.Println("🔍 Application will start but tenant operations may be limited")
+		}
+	}
+
+	// Connect to dedicated telemetry database (separate from landlord)
+	if err := engine.connectToTelemetryDB(); err != nil {
+		log.Printf("⚠️  Failed to connect to telemetry database: %v", err)
+		log.Println("🔍 Error telemetry will not be stored")
+	} else {
+		defer engine.telemetryDB.Close()
+
+		// Initialize telemetry store with dedicated database
+		engine.telemetryStore = NewTelemetryStore(engine.telemetryDB)
+		if err := engine.telemetryStore.EnsureTable(); err != nil {
+			log.Printf("⚠️  Failed to setup telemetry store: %v", err)
+			log.Println("🔍 Error telemetry will not be stored")
 		}
 	}
 

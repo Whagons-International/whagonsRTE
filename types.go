@@ -62,6 +62,7 @@ type WebSocketSession struct {
 // RealtimeEngine is the main engine that manages database connections and WebSocket sessions
 type RealtimeEngine struct {
 	landlordDB                 *sql.DB
+	telemetryDB                *sql.DB // Separate database for error telemetry
 	tenantDBs                  map[string]*sql.DB
 	tenantPublicationListeners map[string]bool                  // tenantName -> listener started
 	tenantConnectLocks         map[string]*sync.Mutex           // tenantName -> per-tenant connection lock

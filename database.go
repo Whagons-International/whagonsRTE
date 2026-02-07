@@ -45,6 +45,60 @@ func (e *RealtimeEngine) connectToLandlord() error {
 	return nil
 }
 
+// connectToTelemetryDB establishes connection to the dedicated telemetry database
+// Creates the database if it doesn't exist
+func (e *RealtimeEngine) connectToTelemetryDB() error {
+	// First, try to create the database if it doesn't exist
+	// Connect to default 'postgres' database to run CREATE DATABASE
+	adminConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=postgres sslmode=disable",
+		config.DBHost, config.DBPort, config.DBUsername, config.DBPassword)
+
+	adminDB, err := sql.Open("postgres", adminConnStr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to postgres for database creation: %w", err)
+	}
+	defer adminDB.Close()
+
+	// Check if database exists, create if not
+	var exists bool
+	err = adminDB.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", config.DBTelemetry).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("failed to check if telemetry database exists: %w", err)
+	}
+
+	if !exists {
+		// CREATE DATABASE cannot be parameterized, but we control config.DBTelemetry
+		_, err = adminDB.Exec(fmt.Sprintf("CREATE DATABASE %s", config.DBTelemetry))
+		if err != nil {
+			return fmt.Errorf("failed to create telemetry database: %w", err)
+		}
+		log.Printf("✅ Created telemetry database: %s", config.DBTelemetry)
+	}
+
+	// Now connect to the telemetry database
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		config.DBHost, config.DBPort, config.DBUsername, config.DBPassword, config.DBTelemetry)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return fmt.Errorf("failed to open telemetry database: %w", err)
+	}
+
+	// Configure connection pool - dedicated for telemetry writes
+	db.SetMaxOpenConns(5)                  // Telemetry is write-heavy but not high volume
+	db.SetMaxIdleConns(2)                  // Keep a couple connections ready
+	db.SetConnMaxLifetime(5 * time.Minute) // Recycle connections periodically
+
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping telemetry database: %w", err)
+	}
+
+	e.telemetryDB = db
+	log.Printf("✅ Connected to telemetry database: %s", config.DBTelemetry)
+
+	return nil
+}
+
 // setupTenantNotifications creates the PostgreSQL trigger system for tenant change notifications
 func (e *RealtimeEngine) setupTenantNotifications() error {
 	log.Println("🔧 Setting up tenant notification system...")
@@ -456,6 +510,15 @@ func (e *RealtimeEngine) closeDatabases() {
 			log.Printf("⚠️  Error closing landlord database: %v", err)
 		} else {
 			log.Println("✅ Closed landlord database")
+		}
+	}
+
+	// Close telemetry database
+	if e.telemetryDB != nil {
+		if err := e.telemetryDB.Close(); err != nil {
+			log.Printf("⚠️  Error closing telemetry database: %v", err)
+		} else {
+			log.Println("✅ Closed telemetry database")
 		}
 	}
 }
