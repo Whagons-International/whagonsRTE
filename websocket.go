@@ -167,7 +167,24 @@ func (e *RealtimeEngine) readPump(wsSession *WebSocketSession) {
 		log.Printf("📥 WebSocket received message from session %s (tenant: %s): %s",
 			wsSession.ID, wsSession.Tenant, string(message))
 
-		// Echo the message back
+		// Try to parse as structured message to route appropriately
+		var baseMsg struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(message, &baseMsg); err == nil {
+			switch baseMsg.Type {
+			case "telemetry":
+				// Handle telemetry messages (error reporting)
+				e.handleTelemetryMessage(wsSession, message)
+				continue
+			case "ping":
+				// Client ping - just update last ping time
+				wsSession.LastPing = time.Now()
+				continue
+			}
+		}
+
+		// Default: Echo the message back
 		var msgData interface{}
 		if err := json.Unmarshal(message, &msgData); err != nil {
 			msgData = string(message)

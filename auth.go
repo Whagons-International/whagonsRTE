@@ -50,13 +50,56 @@ func (e *RealtimeEngine) authenticateTokenForDomainDB(bearerToken, domain string
 
 	log.Printf("🔍 Found tenant '%s' with database '%s' for domain: %s", tenantInfo.Name, tenantInfo.Database, domain)
 
-	// Get the tenant database connection
+	// Get the tenant database connection (connect on-demand if not yet discovered)
+	connectLock := e.getTenantConnectLock(tenantInfo.Name)
+	connectLock.Lock()
+	defer connectLock.Unlock()
+
 	e.mutex.RLock()
 	tenantDB, exists := e.tenantDBs[tenantInfo.Name]
 	e.mutex.RUnlock()
 
 	if !exists {
-		return nil, fmt.Errorf("database connection not found for tenant: %s", tenantInfo.Name)
+		log.Printf("⚠️  Tenant DB not connected yet for %s (domain: %s). Connecting on-demand...", tenantInfo.Name, domain)
+
+		// A tenant row can exist before the tenant DB is ready. Retry a few times with backoff.
+		const maxRetries = 5
+		baseDelay := 200 * time.Millisecond
+		var lastErr error
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			if err := e.connectToTenant(*tenantInfo); err != nil {
+				lastErr = err
+				if attempt == maxRetries {
+					break
+				}
+				delay := time.Duration(attempt) * baseDelay
+				log.Printf("⏱️  On-demand tenant connect failed for %s (attempt %d/%d). Retrying in %v... (error: %v)",
+					tenantInfo.Name, attempt, maxRetries, delay, err)
+				time.Sleep(delay)
+				continue
+			}
+
+			// Connected successfully: start the publication listener for this tenant (exactly once).
+			e.startPublicationListenerOnce(tenantInfo.Name, tenantInfo.Database)
+
+			lastErr = nil
+			break
+		}
+
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to connect to tenant database for %s: %w", tenantInfo.Name, lastErr)
+		}
+
+		// Re-fetch the connected DB handle
+		e.mutex.RLock()
+		tenantDB, exists = e.tenantDBs[tenantInfo.Name]
+		e.mutex.RUnlock()
+		if !exists || tenantDB == nil {
+			return nil, fmt.Errorf("tenant database connection still not available for tenant: %s", tenantInfo.Name)
+		}
+
+		log.Printf("✅ On-demand tenant DB connected for %s (domain: %s)", tenantInfo.Name, domain)
 	}
 
 	// Parse Laravel Sanctum token format: {token_id}|{plain_text_token}

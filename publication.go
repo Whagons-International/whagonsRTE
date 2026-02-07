@@ -11,6 +11,23 @@ import (
 	"github.com/lib/pq"
 )
 
+// startPublicationListenerOnce ensures we only start one publication listener goroutine per tenant.
+// Starting multiple listeners for the same tenant would duplicate broadcasts.
+func (e *RealtimeEngine) startPublicationListenerOnce(tenantName, dbName string) {
+	e.mutex.Lock()
+	if e.tenantPublicationListeners == nil {
+		e.tenantPublicationListeners = make(map[string]bool)
+	}
+	if e.tenantPublicationListeners[tenantName] {
+		e.mutex.Unlock()
+		return
+	}
+	e.tenantPublicationListeners[tenantName] = true
+	e.mutex.Unlock()
+
+	go e.listenToTenantPublications(tenantName, dbName)
+}
+
 // startPublicationListeners starts listeners for all tenant databases
 func (e *RealtimeEngine) startPublicationListeners() {
 	e.mutex.RLock()
@@ -37,7 +54,7 @@ func (e *RealtimeEngine) startPublicationListeners() {
 		}
 
 		if _, exists := tenantDBs[tenantName]; exists {
-			go e.listenToTenantPublications(tenantName, dbName)
+			e.startPublicationListenerOnce(tenantName, dbName)
 		}
 	}
 }
