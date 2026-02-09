@@ -137,6 +137,7 @@ func main() {
 	log.Printf("   GET  /api/telemetry/stats - Get telemetry statistics")
 	log.Printf("   GET  /api/telemetry/sessions - Get active WebSocket sessions")
 	log.Printf("   GET  /api/telemetry/tenants - Get tenants overview")
+	log.Printf("   GET  /api/telemetry/tenants/:name - Get tenant details")
 	log.Printf("   POST /api/telemetry/query - Execute read-only SQL queries")
 
 	// Start HTTP server with Fiber

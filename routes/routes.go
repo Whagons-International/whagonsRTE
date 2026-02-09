@@ -56,6 +56,7 @@ func SetupRoutes(app *fiber.App, engine EngineInterface) {
 	telemetry.Get("/stats", telemetryController.GetStats)
 	telemetry.Get("/sessions", telemetryController.GetSessions)
 	telemetry.Get("/tenants", telemetryController.GetTenants)
+	telemetry.Get("/tenants/:tenantName", telemetryController.GetTenantDetails)
 	telemetry.Post("/query", telemetryController.ExecuteQuery)
 	telemetry.Get("/tables", telemetryController.GetTables)
 	telemetry.Get("/columns", telemetryController.GetTableColumns)

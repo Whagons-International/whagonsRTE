@@ -26,6 +26,7 @@ type TelemetryEngineInterface interface {
 	AuthenticateAndGetEmail(bearerToken, domain string) (string, error)
 	GetSessionsInfo() (interface{}, error)
 	GetTenantsInfo() (interface{}, error)
+	GetTenantDetails(tenantName string) (interface{}, error)
 	ExecuteReadOnlyQuery(tenantName, query string) (interface{}, error)
 	GetDatabaseTables(tenantName string) (interface{}, error)
 	GetTableColumns(tenantName, tableName string) (interface{}, error)
@@ -382,6 +383,60 @@ func (tc *TelemetryController) GetTenants(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(tenants)
+}
+
+// GetTenantDetails retrieves detailed information for a specific tenant
+// @Summary Get tenant details
+// @Description Returns detailed tenant information including stats and active sessions
+// @Tags telemetry
+// @Accept json
+// @Produce json
+// @Param tenantName path string true "Tenant name"
+// @Success 200 {object} map[string]interface{}
+// @Failure 401 {object} map[string]interface{}
+// @Failure 403 {object} map[string]interface{}
+// @Failure 404 {object} map[string]interface{}
+// @Failure 500 {object} map[string]interface{}
+// @Router /api/telemetry/tenants/{tenantName} [get]
+func (tc *TelemetryController) GetTenantDetails(c *fiber.Ctx) error {
+	// Require super admin access
+	_, err := tc.requireSuperAdmin(c)
+	if err != nil {
+		fiberErr, ok := err.(*fiber.Error)
+		if ok {
+			return c.Status(fiberErr.Code).JSON(fiber.Map{
+				"status":    "error",
+				"message":   fiberErr.Message,
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":    "error",
+			"message":   err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	tenantName := c.Params("tenantName")
+	if tenantName == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "tenant name is required",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	details, err := tc.engine.GetTenantDetails(tenantName)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "Failed to get tenant details",
+			"error":     err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(details)
 }
 
 // QueryRequest represents a database query request

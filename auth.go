@@ -522,6 +522,113 @@ func (e *RealtimeEngine) GetTenantsInfo() (interface{}, error) {
 	}, nil
 }
 
+// TenantStats represents statistics for a tenant
+type TenantStats struct {
+	TotalUsers      int `json:"total_users"`
+	ActiveUsers     int `json:"active_users"`
+	TotalTasks      int `json:"total_tasks"`
+	TotalWorkspaces int `json:"total_workspaces"`
+	TotalCategories int `json:"total_categories"`
+	TotalTeams      int `json:"total_teams"`
+}
+
+// TenantDetails represents detailed information about a tenant
+type TenantDetails struct {
+	ID             int           `json:"id"`
+	Name           string        `json:"name"`
+	Domain         string        `json:"domain"`
+	Database       string        `json:"database"`
+	Connected      bool          `json:"connected"`
+	ActiveSessions int           `json:"active_sessions"`
+	Stats          TenantStats   `json:"stats"`
+	RecentErrors   int           `json:"recent_errors"`
+	Sessions       []SessionInfo `json:"sessions"`
+}
+
+// GetTenantDetails returns detailed information about a specific tenant
+func (e *RealtimeEngine) GetTenantDetails(tenantName string) (interface{}, error) {
+	if e.landlordDB == nil {
+		return nil, fmt.Errorf("landlord database not connected")
+	}
+
+	// Get basic tenant info from landlord
+	var details TenantDetails
+	err := e.landlordDB.QueryRow(
+		"SELECT id, name, domain, database FROM tenants WHERE name = $1 AND database IS NOT NULL",
+		tenantName,
+	).Scan(&details.ID, &details.Name, &details.Domain, &details.Database)
+	if err != nil {
+		return nil, fmt.Errorf("tenant not found: %s", tenantName)
+	}
+
+	e.mutex.RLock()
+	tenantDB, connected := e.tenantDBs[tenantName]
+
+	// Get sessions for this tenant
+	sessions := []SessionInfo{}
+	for sessionID, wsSession := range e.sessions {
+		if wsSession.Tenant == tenantName {
+			// Try to get user email from tenant DB
+			email := ""
+			if tenantDB != nil {
+				_ = tenantDB.QueryRow("SELECT email FROM wh_users WHERE id = $1", wsSession.UserID).Scan(&email)
+			}
+
+			// Get auth session for connected_at
+			authSession := e.authenticatedSessions[sessionID]
+			connectedAt := ""
+			if authSession != nil {
+				connectedAt = authSession.LastUsedAt.Format(time.RFC3339)
+			}
+
+			sessions = append(sessions, SessionInfo{
+				SessionID:   sessionID,
+				TenantName:  wsSession.Tenant,
+				UserID:      wsSession.UserID,
+				UserEmail:   email,
+				ConnectedAt: connectedAt,
+				LastPing:    wsSession.LastPing.Format(time.RFC3339),
+			})
+		}
+	}
+	e.mutex.RUnlock()
+
+	details.Connected = connected
+	details.ActiveSessions = len(sessions)
+	details.Sessions = sessions
+
+	// Get stats from tenant database if connected
+	if connected && tenantDB != nil {
+		// Count users
+		tenantDB.QueryRow("SELECT COUNT(*) FROM wh_users").Scan(&details.Stats.TotalUsers)
+
+		// Count active users (users with activity in last 30 days based on updated_at)
+		tenantDB.QueryRow("SELECT COUNT(*) FROM wh_users WHERE updated_at >= NOW() - INTERVAL '30 days'").Scan(&details.Stats.ActiveUsers)
+
+		// Count tasks
+		tenantDB.QueryRow("SELECT COUNT(*) FROM wh_tasks").Scan(&details.Stats.TotalTasks)
+
+		// Count workspaces
+		tenantDB.QueryRow("SELECT COUNT(*) FROM wh_workspaces").Scan(&details.Stats.TotalWorkspaces)
+
+		// Count categories
+		tenantDB.QueryRow("SELECT COUNT(*) FROM wh_categories").Scan(&details.Stats.TotalCategories)
+
+		// Count teams
+		tenantDB.QueryRow("SELECT COUNT(*) FROM wh_teams").Scan(&details.Stats.TotalTeams)
+	}
+
+	// Count recent errors from telemetry (last 24h)
+	if e.telemetryStore != nil && e.telemetryStore.db != nil {
+		e.telemetryStore.db.QueryRow(
+			"SELECT COUNT(*) FROM error_telemetry WHERE tenant_name = $1 AND received_at >= NOW() - INTERVAL '24 hours'",
+			tenantName,
+		).Scan(&details.RecentErrors)
+	}
+
+	return &details, nil
+}
+
 // DbQueryResult represents a database query result
 type DbQueryResult struct {
 	Columns         []string                 `json:"columns"`
