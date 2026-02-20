@@ -52,11 +52,12 @@ type SystemMessage struct {
 
 // WebSocketSession wraps a WebSocket connection with session metadata
 type WebSocketSession struct {
-	Conn     *websocket.Conn
-	ID       string
-	Tenant   string
-	UserID   int
-	LastPing time.Time
+	Conn       *websocket.Conn
+	ID         string
+	Tenant     string
+	UserID     int
+	LastPing   time.Time
+	ClientInfo json.RawMessage // Stores client_info reported by the client (service workers, browser, etc.)
 }
 
 // RealtimeEngine is the main engine that manages database connections and WebSocket sessions

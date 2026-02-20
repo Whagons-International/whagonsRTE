@@ -637,6 +637,42 @@ type DbQueryResult struct {
 	ExecutionTimeMs float64                  `json:"execution_time_ms"`
 }
 
+// containsSQLKeyword checks if a keyword appears as a standalone SQL keyword
+// (not as part of a column/table name like "updated_at" containing "UPDATE")
+func containsSQLKeyword(query, keyword string) bool {
+	idx := 0
+	for {
+		pos := strings.Index(query[idx:], keyword)
+		if pos < 0 {
+			return false
+		}
+		pos += idx
+		// Check character before the keyword
+		if pos > 0 {
+			before := query[pos-1]
+			if isIdentChar(before) {
+				idx = pos + len(keyword)
+				continue
+			}
+		}
+		// Check character after the keyword
+		end := pos + len(keyword)
+		if end < len(query) {
+			after := query[end]
+			if isIdentChar(after) {
+				idx = pos + len(keyword)
+				continue
+			}
+		}
+		return true
+	}
+}
+
+// isIdentChar returns true if the byte is a valid SQL identifier character
+func isIdentChar(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
+}
+
 // ExecuteReadOnlyQuery executes a read-only SQL query against a tenant database
 func (e *RealtimeEngine) ExecuteReadOnlyQuery(tenantName, query string) (interface{}, error) {
 	e.mutex.RLock()
@@ -655,10 +691,10 @@ func (e *RealtimeEngine) ExecuteReadOnlyQuery(tenantName, query string) (interfa
 		return nil, fmt.Errorf("only SELECT/WITH/EXPLAIN queries are allowed")
 	}
 
-	// Disallow dangerous keywords
+	// Disallow dangerous keywords (as standalone SQL statements, not as part of column names)
 	dangerousKeywords := []string{"INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE"}
 	for _, keyword := range dangerousKeywords {
-		if strings.Contains(normalizedQuery, keyword) {
+		if containsSQLKeyword(normalizedQuery, keyword) {
 			return nil, fmt.Errorf("query contains forbidden keyword: %s", keyword)
 		}
 	}

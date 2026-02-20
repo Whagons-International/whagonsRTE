@@ -25,6 +25,8 @@ type TelemetryEngineInterface interface {
 	GetTelemetryStats() (interface{}, error)
 	AuthenticateAndGetEmail(bearerToken, domain string) (string, error)
 	GetSessionsInfo() (interface{}, error)
+	GetSessionByID(sessionID string) (interface{}, error)
+	SendCommandToSession(sessionID, command, message string, data interface{}) error
 	GetTenantsInfo() (interface{}, error)
 	GetTenantDetails(tenantName string) (interface{}, error)
 	ExecuteReadOnlyQuery(tenantName, query string) (interface{}, error)
@@ -437,6 +439,161 @@ func (tc *TelemetryController) GetTenantDetails(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(details)
+}
+
+// GetSessionDetail retrieves detailed information for a specific session
+// @Summary Get session detail
+// @Description Returns detailed information for a specific WebSocket session
+// @Tags telemetry
+// @Accept json
+// @Produce json
+// @Param sessionId path string true "Session ID"
+// @Success 200 {object} map[string]interface{}
+// @Failure 401 {object} map[string]interface{}
+// @Failure 403 {object} map[string]interface{}
+// @Failure 404 {object} map[string]interface{}
+// @Router /api/telemetry/sessions/{sessionId} [get]
+func (tc *TelemetryController) GetSessionDetail(c *fiber.Ctx) error {
+	// Require super admin access
+	_, err := tc.requireSuperAdmin(c)
+	if err != nil {
+		fiberErr, ok := err.(*fiber.Error)
+		if ok {
+			return c.Status(fiberErr.Code).JSON(fiber.Map{
+				"status":    "error",
+				"message":   fiberErr.Message,
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":    "error",
+			"message":   err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	sessionID := c.Params("sessionId")
+	if sessionID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "session ID is required",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	detail, err := tc.engine.GetSessionByID(sessionID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"status":    "error",
+			"message":   err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(detail)
+}
+
+// SendSessionCommandRequest represents a request to send a command to a session
+type SendSessionCommandRequest struct {
+	Command string      `json:"command"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+// SendSessionCommand sends a command message to a specific session via WebSocket
+// @Summary Send command to session
+// @Description Sends a remote command to a specific WebSocket session (e.g., clear_cache, resync)
+// @Tags telemetry
+// @Accept json
+// @Produce json
+// @Param sessionId path string true "Session ID"
+// @Param request body SendSessionCommandRequest true "Command request"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} map[string]interface{}
+// @Failure 401 {object} map[string]interface{}
+// @Failure 403 {object} map[string]interface{}
+// @Failure 404 {object} map[string]interface{}
+// @Router /api/telemetry/sessions/{sessionId}/command [post]
+func (tc *TelemetryController) SendSessionCommand(c *fiber.Ctx) error {
+	// Require super admin access
+	_, err := tc.requireSuperAdmin(c)
+	if err != nil {
+		fiberErr, ok := err.(*fiber.Error)
+		if ok {
+			return c.Status(fiberErr.Code).JSON(fiber.Map{
+				"status":    "error",
+				"message":   fiberErr.Message,
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":    "error",
+			"message":   err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	sessionID := c.Params("sessionId")
+	if sessionID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "session ID is required",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	var req SendSessionCommandRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "Invalid request body",
+			"error":     err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	if req.Command == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "command field is required",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	// Validate allowed commands
+	allowedCommands := map[string]bool{
+		"clear_cache":   true,
+		"resync":        true,
+		"reload":        true,
+		"unregister_sw": true,
+	}
+	if !allowedCommands[req.Command] {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   fmt.Sprintf("unknown command: %s. Allowed: clear_cache, resync, reload, unregister_sw", req.Command),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	// Send the command through the engine
+	if err := tc.engine.SendCommandToSession(sessionID, req.Command, fmt.Sprintf("Remote command: %s", req.Command), req.Data); err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"status":    "error",
+			"message":   err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	log.Printf("📡 Sent command '%s' to session %s", req.Command, sessionID)
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"status":  "success",
+		"message": fmt.Sprintf("Command '%s' sent to session %s", req.Command, sessionID),
+		"data": fiber.Map{
+			"session_id": sessionID,
+			"command":    req.Command,
+			"timestamp":  time.Now().Format(time.RFC3339),
+		},
+	})
 }
 
 // QueryRequest represents a database query request

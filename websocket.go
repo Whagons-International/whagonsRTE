@@ -181,6 +181,11 @@ func (e *RealtimeEngine) readPump(wsSession *WebSocketSession) {
 				// Client ping - just update last ping time
 				wsSession.LastPing = time.Now()
 				continue
+			case "client_info":
+				// Store client info (service workers, browser, etc.)
+				wsSession.ClientInfo = message
+				log.Printf("📋 Received client_info from session %s (tenant: %s)", wsSession.ID, wsSession.Tenant)
+				continue
 			}
 		}
 
@@ -364,6 +369,78 @@ func (e *RealtimeEngine) GetCacheStats() map[string]int {
 		"expired_tokens":      expiredCount,
 		"active_tokens":       totalCached - expiredCount,
 	}
+}
+
+// SendCommandToSession sends a command message to a specific session by ID
+func (e *RealtimeEngine) SendCommandToSession(sessionID, command, message string, data interface{}) error {
+	e.mutex.RLock()
+	wsSession, exists := e.sessions[sessionID]
+	e.mutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+
+	msg := SystemMessage{
+		Type:      "command",
+		Operation: command,
+		Message:   message,
+		Data:      data,
+		Timestamp: time.Now().Format(time.RFC3339),
+		SessionId: sessionID,
+	}
+	return e.sendMessage(wsSession, msg)
+}
+
+// GetSessionByID returns session info for a specific session
+func (e *RealtimeEngine) GetSessionByID(sessionID string) (interface{}, error) {
+	e.mutex.RLock()
+	defer e.mutex.RUnlock()
+
+	wsSession, exists := e.sessions[sessionID]
+	if !exists {
+		return nil, fmt.Errorf("session %s not found", sessionID)
+	}
+
+	// Get user email from tenant DB
+	email := ""
+	if tenantDB, ok := e.tenantDBs[wsSession.Tenant]; ok && tenantDB != nil {
+		_ = tenantDB.QueryRow("SELECT email FROM wh_users WHERE id = $1", wsSession.UserID).Scan(&email)
+	}
+
+	// Get user name from tenant DB
+	name := ""
+	if tenantDB, ok := e.tenantDBs[wsSession.Tenant]; ok && tenantDB != nil {
+		_ = tenantDB.QueryRow("SELECT name FROM wh_users WHERE id = $1", wsSession.UserID).Scan(&name)
+	}
+
+	authSession := e.authenticatedSessions[sessionID]
+	connectedAt := ""
+	if authSession != nil {
+		connectedAt = authSession.LastUsedAt.Format(time.RFC3339)
+	}
+
+	result := map[string]interface{}{
+		"session_id":   sessionID,
+		"tenant_name":  wsSession.Tenant,
+		"user_id":      wsSession.UserID,
+		"user_email":   email,
+		"user_name":    name,
+		"connected_at": connectedAt,
+		"last_ping":    wsSession.LastPing.Format(time.RFC3339),
+	}
+
+	// Include client_info if available
+	if wsSession.ClientInfo != nil {
+		var clientInfo struct {
+			Data interface{} `json:"data"`
+		}
+		if err := json.Unmarshal(wsSession.ClientInfo, &clientInfo); err == nil && clientInfo.Data != nil {
+			result["client_info"] = clientInfo.Data
+		}
+	}
+
+	return result, nil
 }
 
 // cleanupSession removes a session from all tracking maps
