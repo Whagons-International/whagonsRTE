@@ -35,6 +35,7 @@ type TelemetryEngineInterface interface {
 	GetTableRows(tenantName, tableName string, page, perPage int, sortBy, sortOrder string) (interface{}, error)
 	UpdateTableRow(tenantName, tableName string, primaryKey, updates map[string]interface{}, force bool) error
 	DeleteTableRow(tenantName, tableName string, primaryKey map[string]interface{}, force bool) error
+	DeleteTenant(tenantID int) (interface{}, error)
 }
 
 // TelemetryQueryParams mirrors the main package struct
@@ -1027,5 +1028,90 @@ func (tc *TelemetryController) DeleteRow(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"status":  "success",
 		"message": "Row deleted successfully",
+	})
+}
+
+// DeleteTenantRequest represents a request to delete an entire tenant
+type DeleteTenantRequest struct {
+	TenantID int    `json:"tenant_id"`
+	Secret   string `json:"secret"`
+}
+
+// DeleteTenant drops a tenant database, removes the landlord row, and disconnects.
+// Requires super admin access + tech support secret. Uses tenant ID to avoid ambiguity.
+// @Summary Delete a tenant
+// @Description Drops tenant database, removes landlord row, cleans up mappings (requires secret)
+// @Tags telemetry
+// @Accept json
+// @Produce json
+// @Param request body DeleteTenantRequest true "Delete tenant request"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} map[string]interface{}
+// @Failure 401 {object} map[string]interface{}
+// @Failure 403 {object} map[string]interface{}
+// @Failure 500 {object} map[string]interface{}
+// @Router /api/telemetry/tenant [delete]
+func (tc *TelemetryController) DeleteTenant(c *fiber.Ctx) error {
+	// Require super admin access
+	_, err := tc.requireSuperAdmin(c)
+	if err != nil {
+		fiberErr, ok := err.(*fiber.Error)
+		if ok {
+			return c.Status(fiberErr.Code).JSON(fiber.Map{
+				"status":    "error",
+				"message":   fiberErr.Message,
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":    "error",
+			"message":   err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	var req DeleteTenantRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "Invalid request body",
+			"error":     err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	// Validate secret
+	if req.Secret != techSupportSecret {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "Invalid tech support secret",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	if req.TenantID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "tenant_id is required and must be positive",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	log.Printf("⚠️  [TECH SUPPORT] DELETE TENANT requested: id=%d", req.TenantID)
+
+	result, err := tc.engine.DeleteTenant(req.TenantID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":    "error",
+			"message":   "Failed to delete tenant",
+			"error":     err.Error(),
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"status":  "success",
+		"message": "Tenant deleted",
+		"data":    result,
 	})
 }
