@@ -65,6 +65,7 @@ func SetupRoutes(app *fiber.App, engine EngineInterface) {
 	telemetry.Get("/rows", telemetryController.GetTableRows)
 	telemetry.Put("/row", telemetryController.UpdateRow)
 	telemetry.Delete("/row", telemetryController.DeleteRow)
+	telemetry.Delete("/tenant", telemetryController.DeleteTenant)
 }
 
 // setupMiddleware configures middleware for the Fiber app

@@ -473,6 +473,21 @@ type TenantsResponse struct {
 	Connected int          `json:"connected"`
 }
 
+// LandlordTenantName is the special tenant name used to access the landlord database
+const LandlordTenantName = "__landlord__"
+
+// getDBForTenant returns the *sql.DB for a given tenant name.
+// If tenantName is LandlordTenantName, it returns the landlord DB.
+func (e *RealtimeEngine) getDBForTenant(tenantName string) (*sql.DB, bool) {
+	if tenantName == LandlordTenantName {
+		return e.landlordDB, e.landlordDB != nil
+	}
+	e.mutex.RLock()
+	db, exists := e.tenantDBs[tenantName]
+	e.mutex.RUnlock()
+	return db, exists && db != nil
+}
+
 // GetTenantsInfo returns information about all tenants
 func (e *RealtimeEngine) GetTenantsInfo() (interface{}, error) {
 	if e.landlordDB == nil {
@@ -495,8 +510,18 @@ func (e *RealtimeEngine) GetTenantsInfo() (interface{}, error) {
 		sessionsByTenant[wsSession.Tenant]++
 	}
 
-	tenants := []TenantInfo{}
-	connectedCount := 0
+	// Always include landlord DB as the first entry
+	tenants := []TenantInfo{
+		{
+			ID:             0,
+			Name:           LandlordTenantName,
+			Domain:         "landlord",
+			Database:       config.DBLandlord,
+			Connected:      true,
+			ActiveSessions: 0,
+		},
+	}
+	connectedCount := 1 // landlord is always connected
 
 	for rows.Next() {
 		var t TenantInfo
@@ -675,9 +700,7 @@ func isIdentChar(b byte) bool {
 
 // ExecuteReadOnlyQuery executes a read-only SQL query against a tenant database
 func (e *RealtimeEngine) ExecuteReadOnlyQuery(tenantName, query string) (interface{}, error) {
-	e.mutex.RLock()
-	tenantDB, exists := e.tenantDBs[tenantName]
-	e.mutex.RUnlock()
+	tenantDB, exists := e.getDBForTenant(tenantName)
 
 	if !exists || tenantDB == nil {
 		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
@@ -773,9 +796,7 @@ type TablesResponse struct {
 
 // GetDatabaseTables returns all tables in a tenant database
 func (e *RealtimeEngine) GetDatabaseTables(tenantName string) (interface{}, error) {
-	e.mutex.RLock()
-	tenantDB, exists := e.tenantDBs[tenantName]
-	e.mutex.RUnlock()
+	tenantDB, exists := e.getDBForTenant(tenantName)
 
 	if !exists || tenantDB == nil {
 		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
@@ -834,9 +855,7 @@ type ColumnsResponse struct {
 
 // GetTableColumns returns column information for a specific table
 func (e *RealtimeEngine) GetTableColumns(tenantName, tableName string) (interface{}, error) {
-	e.mutex.RLock()
-	tenantDB, exists := e.tenantDBs[tenantName]
-	e.mutex.RUnlock()
+	tenantDB, exists := e.getDBForTenant(tenantName)
 
 	if !exists || tenantDB == nil {
 		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
@@ -908,9 +927,7 @@ type RowsResponse struct {
 
 // GetTableRows returns paginated rows from a specific table
 func (e *RealtimeEngine) GetTableRows(tenantName, tableName string, page, perPage int, sortBy, sortOrder string) (interface{}, error) {
-	e.mutex.RLock()
-	tenantDB, exists := e.tenantDBs[tenantName]
-	e.mutex.RUnlock()
+	tenantDB, exists := e.getDBForTenant(tenantName)
 
 	if !exists || tenantDB == nil {
 		return nil, fmt.Errorf("tenant database not connected: %s", tenantName)
@@ -1004,6 +1021,106 @@ func (e *RealtimeEngine) GetTableRows(tenantName, tableName string, page, perPag
 	}, nil
 }
 
+// DeleteTenantResult holds the outcome of each step during tenant deletion
+type DeleteTenantResult struct {
+	TenantID     int      `json:"tenant_id"`
+	TenantName   string   `json:"tenant_name"`
+	DatabaseName string   `json:"database_name"`
+	DBDropped    bool     `json:"db_dropped"`
+	RowDeleted   bool     `json:"row_deleted"`
+	Disconnected bool     `json:"disconnected"`
+	Errors       []string `json:"errors,omitempty"`
+}
+
+// DeleteTenant drops the tenant database, removes the row from the landlord tenants table,
+// and disconnects the in-memory DB pool. Works by tenant ID to avoid ambiguity with duplicate names.
+func (e *RealtimeEngine) DeleteTenant(tenantID int) (interface{}, error) {
+	if e.landlordDB == nil {
+		return nil, fmt.Errorf("landlord database not connected")
+	}
+
+	// 1. Look up tenant by ID from landlord
+	var name, domain, database string
+	err := e.landlordDB.QueryRow(
+		"SELECT name, domain, database FROM tenants WHERE id = $1", tenantID,
+	).Scan(&name, &domain, &database)
+	if err != nil {
+		return nil, fmt.Errorf("tenant with id %d not found: %w", tenantID, err)
+	}
+
+	result := &DeleteTenantResult{
+		TenantID:     tenantID,
+		TenantName:   name,
+		DatabaseName: database,
+	}
+
+	log.Printf("⚠️  [TECH SUPPORT] Deleting tenant id=%d name=%s db=%s", tenantID, name, database)
+
+	// 2. Disconnect the in-memory pool first (stop new queries)
+	e.mutex.Lock()
+	if db, exists := e.tenantDBs[name]; exists {
+		if err := db.Close(); err != nil {
+			log.Printf("⚠️  Error closing tenant DB pool %s: %v", name, err)
+			result.Errors = append(result.Errors, fmt.Sprintf("close pool: %v", err))
+		}
+		delete(e.tenantDBs, name)
+		result.Disconnected = true
+		log.Printf("🔌 Disconnected tenant pool: %s", name)
+	} else {
+		result.Disconnected = true // wasn't connected, that's fine
+	}
+	e.mutex.Unlock()
+
+	// 3. Terminate active connections and drop the database
+	if database != "" && isValidIdentifier(database) {
+		// Terminate all active connections to the tenant DB
+		_, _ = e.landlordDB.Exec(
+			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+			database,
+		)
+
+		_, err := e.landlordDB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS \"%s\"", database))
+		if err != nil {
+			log.Printf("⚠️  Failed to drop database %s: %v", database, err)
+			result.Errors = append(result.Errors, fmt.Sprintf("drop db: %v", err))
+		} else {
+			result.DBDropped = true
+			log.Printf("🗑️  Dropped database: %s", database)
+		}
+	}
+
+	// 4. Delete the tenant row from landlord (by ID, so only this one row)
+	res, err := e.landlordDB.Exec("DELETE FROM tenants WHERE id = $1", tenantID)
+	if err != nil {
+		log.Printf("⚠️  Failed to delete tenant row id=%d: %v", tenantID, err)
+		result.Errors = append(result.Errors, fmt.Sprintf("delete row: %v", err))
+	} else {
+		rowsAffected, _ := res.RowsAffected()
+		result.RowDeleted = rowsAffected > 0
+		log.Printf("✅ Deleted tenant row id=%d (rows affected: %d)", tenantID, rowsAffected)
+	}
+
+	// 5. Also clean up user-tenant mappings
+	// tenant_domain_prefix is the first segment of the domain (e.g., "acme" from "acme.whagons.com")
+	domainPrefix := domain
+	if dotIdx := strings.Index(domain, "."); dotIdx > 0 {
+		domainPrefix = domain[:dotIdx]
+	}
+	_, mapErr := e.landlordDB.Exec("DELETE FROM tenant_map WHERE tenant_domain_prefix = $1", domainPrefix)
+	if mapErr != nil {
+		log.Printf("⚠️  Failed to clean up tenant_map for %s (prefix: %s): %v", name, domainPrefix, mapErr)
+		result.Errors = append(result.Errors, fmt.Sprintf("clean tenant_map: %v", mapErr))
+	}
+
+	if len(result.Errors) > 0 {
+		log.Printf("⚠️  [TECH SUPPORT] Tenant deletion completed with errors: %v", result.Errors)
+	} else {
+		log.Printf("✅ [TECH SUPPORT] Tenant deleted successfully: id=%d name=%s", tenantID, name)
+	}
+
+	return result, nil
+}
+
 // isValidIdentifier checks if a string is a valid SQL identifier (table/column name)
 func isValidIdentifier(name string) bool {
 	if name == "" || len(name) > 128 {
@@ -1026,9 +1143,7 @@ func isValidIdentifier(name string) bool {
 
 // UpdateTableRow updates a row in a tenant database
 func (e *RealtimeEngine) UpdateTableRow(tenantName, tableName string, primaryKey, updates map[string]interface{}, force bool) error {
-	e.mutex.RLock()
-	tenantDB, exists := e.tenantDBs[tenantName]
-	e.mutex.RUnlock()
+	tenantDB, exists := e.getDBForTenant(tenantName)
 
 	if !exists || tenantDB == nil {
 		return fmt.Errorf("tenant database not connected: %s", tenantName)
@@ -1098,9 +1213,7 @@ func (e *RealtimeEngine) UpdateTableRow(tenantName, tableName string, primaryKey
 
 // DeleteTableRow deletes a row from a tenant database
 func (e *RealtimeEngine) DeleteTableRow(tenantName, tableName string, primaryKey map[string]interface{}, force bool) error {
-	e.mutex.RLock()
-	tenantDB, exists := e.tenantDBs[tenantName]
-	e.mutex.RUnlock()
+	tenantDB, exists := e.getDBForTenant(tenantName)
 
 	if !exists || tenantDB == nil {
 		return fmt.Errorf("tenant database not connected: %s", tenantName)
