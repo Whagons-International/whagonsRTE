@@ -1072,14 +1072,14 @@ func (e *RealtimeEngine) DeleteTenant(tenantID int) (interface{}, error) {
 	e.mutex.Unlock()
 
 	// 3. Terminate active connections and drop the database
-	if database != "" {
+	if database != "" && isValidIdentifier(database) {
 		// Terminate all active connections to the tenant DB
 		_, _ = e.landlordDB.Exec(
 			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
 			database,
 		)
 
-		_, err := e.landlordDB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s", database))
+		_, err := e.landlordDB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS \"%s\"", database))
 		if err != nil {
 			log.Printf("⚠️  Failed to drop database %s: %v", database, err)
 			result.Errors = append(result.Errors, fmt.Sprintf("drop db: %v", err))
@@ -1101,9 +1101,14 @@ func (e *RealtimeEngine) DeleteTenant(tenantID int) (interface{}, error) {
 	}
 
 	// 5. Also clean up user-tenant mappings
-	_, mapErr := e.landlordDB.Exec("DELETE FROM tenant_map WHERE tenant_domain_prefix = $1", name)
+	// tenant_domain_prefix is the first segment of the domain (e.g., "acme" from "acme.whagons.com")
+	domainPrefix := domain
+	if dotIdx := strings.Index(domain, "."); dotIdx > 0 {
+		domainPrefix = domain[:dotIdx]
+	}
+	_, mapErr := e.landlordDB.Exec("DELETE FROM tenant_map WHERE tenant_domain_prefix = $1", domainPrefix)
 	if mapErr != nil {
-		log.Printf("⚠️  Failed to clean up tenant_map for %s: %v", name, mapErr)
+		log.Printf("⚠️  Failed to clean up tenant_map for %s (prefix: %s): %v", name, domainPrefix, mapErr)
 		result.Errors = append(result.Errors, fmt.Sprintf("clean tenant_map: %v", mapErr))
 	}
 
