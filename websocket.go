@@ -169,7 +169,9 @@ func (e *RealtimeEngine) readPump(wsSession *WebSocketSession) {
 
 		// Try to parse as structured message to route appropriately
 		var baseMsg struct {
-			Type string `json:"type"`
+			Type      string      `json:"type"`
+			Operation string      `json:"operation"`
+			Data      interface{} `json:"data"`
 		}
 		if err := json.Unmarshal(message, &baseMsg); err == nil {
 			switch baseMsg.Type {
@@ -186,10 +188,28 @@ func (e *RealtimeEngine) readPump(wsSession *WebSocketSession) {
 				wsSession.ClientInfo = message
 				log.Printf("📋 Received client_info from session %s (tenant: %s)", wsSession.ID, wsSession.Tenant)
 				continue
+			case "echo":
+				// Broadcast echo messages to all sessions in the same tenant
+				// (used for typing indicators, read receipts, etc.)
+				e.broadcastEchoToTenant(wsSession, baseMsg.Operation, baseMsg.Data)
+				continue
+			case "send_to_user":
+				// Send a message to all sessions of a specific user in the same tenant
+				// (used for call signals targeted at a specific user)
+				var targetMsg struct {
+					Type      string      `json:"type"`
+					Operation string      `json:"operation"`
+					TargetUID int         `json:"target_user_id"`
+					Data      interface{} `json:"data"`
+				}
+				if err := json.Unmarshal(message, &targetMsg); err == nil && targetMsg.TargetUID > 0 {
+					e.sendToUser(wsSession, targetMsg.TargetUID, targetMsg.Operation, targetMsg.Data)
+				}
+				continue
 			}
 		}
 
-		// Default: Echo the message back
+		// Default: Echo the message back to sender only
 		var msgData interface{}
 		if err := json.Unmarshal(message, &msgData); err != nil {
 			msgData = string(message)
@@ -347,6 +367,103 @@ func (e *RealtimeEngine) BroadcastMessage(msgType, operation, message string, da
 	}
 
 	e.BroadcastSystemMessage(systemMessage)
+}
+
+// broadcastEchoToTenant broadcasts an echo message to all authenticated sessions
+// in the same tenant as the sender. Used for ephemeral events like typing
+// indicators and read receipts that need to reach other users in real-time.
+func (e *RealtimeEngine) broadcastEchoToTenant(sender *WebSocketSession, operation string, data interface{}) {
+	e.mutex.RLock()
+	sessions := make(map[string]*WebSocketSession)
+	authSessions := make(map[string]*AuthenticatedSession)
+	for id, session := range e.sessions {
+		sessions[id] = session
+	}
+	for id, authSession := range e.authenticatedSessions {
+		authSessions[id] = authSession
+	}
+	e.mutex.RUnlock()
+
+	msg := SystemMessage{
+		Type:      "echo",
+		Operation: operation,
+		Data:      data,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+
+	sent := 0
+	for sessionID, wsSession := range sessions {
+		authSession, isAuth := authSessions[sessionID]
+		if !isAuth {
+			continue
+		}
+		// Only send to sessions belonging to the same tenant
+		if authSession.TenantName != sender.Tenant {
+			continue
+		}
+
+		msg.SessionId = sessionID
+		if err := e.sendMessage(wsSession, msg); err != nil {
+			e.mutex.Lock()
+			delete(e.sessions, sessionID)
+			delete(e.authenticatedSessions, sessionID)
+			e.mutex.Unlock()
+		} else {
+			sent++
+		}
+	}
+
+	log.Printf("📡 Echo broadcast (%s) to %d sessions in tenant %s", operation, sent, sender.Tenant)
+}
+
+// sendToUser sends a message to all authenticated sessions of a specific user
+// in the same tenant as the sender. Used for targeted call signals (offer/answer/ICE).
+func (e *RealtimeEngine) sendToUser(sender *WebSocketSession, targetUserID int, operation string, data interface{}) {
+	e.mutex.RLock()
+	sessions := make(map[string]*WebSocketSession)
+	authSessions := make(map[string]*AuthenticatedSession)
+	for id, session := range e.sessions {
+		sessions[id] = session
+	}
+	for id, authSession := range e.authenticatedSessions {
+		authSessions[id] = authSession
+	}
+	e.mutex.RUnlock()
+
+	msg := SystemMessage{
+		Type:      "targeted",
+		Operation: operation,
+		Data:      data,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+
+	sent := 0
+	for sessionID, wsSession := range sessions {
+		authSession, isAuth := authSessions[sessionID]
+		if !isAuth {
+			continue
+		}
+		// Same tenant only
+		if authSession.TenantName != sender.Tenant {
+			continue
+		}
+		// Target user only
+		if authSession.UserID != targetUserID {
+			continue
+		}
+
+		msg.SessionId = sessionID
+		if err := e.sendMessage(wsSession, msg); err != nil {
+			e.mutex.Lock()
+			delete(e.sessions, sessionID)
+			delete(e.authenticatedSessions, sessionID)
+			e.mutex.Unlock()
+		} else {
+			sent++
+		}
+	}
+
+	log.Printf("🎯 Targeted send (%s) to user %d: %d sessions in tenant %s", operation, targetUserID, sent, sender.Tenant)
 }
 
 // GetCacheStats returns statistics about the token cache
